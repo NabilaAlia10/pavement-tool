@@ -192,41 +192,198 @@ tab_input, tab_results, tab_dashboard, tab_about = st.tabs(
 # ---------------------------------------------------------------------------
 with tab_input:
     st.subheader("Pavement Condition Input Data")
-    st.caption("Edit values directly in the tables below. Changes apply immediately to the results.")
+    st.caption("Bring in your own data, add records one at a time, or review everything that's been entered.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**PCI Input — Defect Records**")
-        st.session_state.pci_input = st.data_editor(
-            st.session_state.pci_input,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Defect Type": st.column_config.SelectboxColumn(
-                    options=list(st.session_state.defect_weights.keys())
-                ),
-                "Severity": st.column_config.SelectboxColumn(
-                    options=list(st.session_state.severity_factors.keys())
-                ),
-                "Area Affected (%)": st.column_config.NumberColumn(min_value=0, max_value=100, step=0.1),
-            },
-            key="pci_editor",
+    # =======================================================================
+    # SECTION A: Upload your own data
+    # =======================================================================
+    st.markdown("### 📤 Upload Your Data")
+    st.caption(
+        "Have your own pavement survey data? Upload a CSV or Excel file here. "
+        "Not sure of the format? Download a blank template below first."
+    )
+
+    up_col1, up_col2 = st.columns(2)
+
+    with up_col1:
+        st.markdown("**PCI defect data**")
+        pci_template = pd.DataFrame({
+            "Section ID": [1, 1],
+            "Defect Type": ["Potholes", "Longitudinal Crack"],
+            "Severity": ["Medium", "Low"],
+            "Area Affected (%)": [5.0, 3.0],
+            "Notes / Photo Ref": ["", ""],
+        })
+        tmpl_buf = io.StringIO()
+        pci_template.to_csv(tmpl_buf, index=False)
+        st.download_button(
+            "⬇️ Download PCI template (CSV)", tmpl_buf.getvalue(),
+            file_name="pci_template.csv", mime="text/csv", key="pci_tmpl_dl",
         )
-    with col2:
-        st.markdown("**IRI Input — Roughness Readings**")
-        st.session_state.iri_input = st.data_editor(
-            st.session_state.iri_input,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "IRI (m/km)": st.column_config.NumberColumn(min_value=0, max_value=20, step=0.01),
-            },
-            key="iri_editor",
+        new_pci_file = st.file_uploader(
+            "Upload PCI defect data", type=["csv", "xlsx"], key="pci_upload_widget"
         )
+        if new_pci_file is not None:
+            try:
+                if new_pci_file.name.endswith(".csv"):
+                    new_pci_df = pd.read_csv(new_pci_file)
+                else:
+                    new_pci_df = pd.read_excel(new_pci_file)
+                required = {"Section ID", "Defect Type", "Severity", "Area Affected (%)"}
+                if not required.issubset(set(new_pci_df.columns)):
+                    st.error(f"File must contain columns: {', '.join(required)}")
+                else:
+                    if st.button("Replace PCI data with uploaded file", key="confirm_pci_replace"):
+                        st.session_state.pci_input = new_pci_df
+                        st.success(f"Loaded {len(new_pci_df)} PCI records.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+
+    with up_col2:
+        st.markdown("**IRI roughness data**")
+        iri_template = pd.DataFrame({
+            "Section ID": [1, 1],
+            "Segment ID": [1, 2],
+            "Start Chainage (m)": [0, 20],
+            "End Chainage (m)": [20, 40],
+            "IRI (m/km)": [2.1, 2.3],
+            "Notes": ["", ""],
+        })
+        tmpl_buf2 = io.StringIO()
+        iri_template.to_csv(tmpl_buf2, index=False)
+        st.download_button(
+            "⬇️ Download IRI template (CSV)", tmpl_buf2.getvalue(),
+            file_name="iri_template.csv", mime="text/csv", key="iri_tmpl_dl",
+        )
+        new_iri_file = st.file_uploader(
+            "Upload IRI roughness data", type=["csv", "xlsx"], key="iri_upload_widget"
+        )
+        if new_iri_file is not None:
+            try:
+                if new_iri_file.name.endswith(".csv"):
+                    new_iri_df = pd.read_csv(new_iri_file)
+                else:
+                    new_iri_df = pd.read_excel(new_iri_file)
+                required = {"Section ID", "IRI (m/km)"}
+                if not required.issubset(set(new_iri_df.columns)):
+                    st.error(f"File must contain columns: {', '.join(required)}")
+                else:
+                    if st.button("Replace IRI data with uploaded file", key="confirm_iri_replace"):
+                        st.session_state.iri_input = new_iri_df
+                        st.success(f"Loaded {len(new_iri_df)} IRI records.")
+                        st.rerun()
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+
+    st.markdown(
+        "_Or upload a single Excel file with both `PCI_Input` and `IRI_Input` sheets "
+        "using the **Data Source** option in the sidebar instead._"
+    )
+
+    st.divider()
+
+    # =======================================================================
+    # SECTION B: Add a record (form-based entry)
+    # =======================================================================
+    st.markdown("### ➕ Add a Record")
+    st.caption("Add one entry at a time — no spreadsheet editing needed.")
+
+    form_col1, form_col2 = st.columns(2)
+
+    with form_col1:
+        st.markdown("**Add a PCI defect observation**")
+        with st.form("add_pci_form", clear_on_submit=True):
+            existing_sections = sorted(set(
+                pd.to_numeric(st.session_state.pci_input["Section ID"], errors="coerce").dropna().astype(int).tolist()
+            )) or [1]
+            f_section = st.number_input(
+                "Section ID", min_value=1, max_value=999,
+                value=int(max(existing_sections)) if existing_sections else 1, step=1,
+            )
+            f_defect = st.selectbox("Defect Type", list(st.session_state.defect_weights.keys()))
+            f_severity = st.selectbox("Severity", list(st.session_state.severity_factors.keys()), index=1)
+            f_area = st.slider("Area Affected (%)", 0.0, 100.0, 5.0, step=0.5)
+            f_notes = st.text_input("Notes / Photo Ref (optional)", "")
+            submitted_pci = st.form_submit_button("➕ Add PCI Entry", use_container_width=True)
+            if submitted_pci:
+                new_row = pd.DataFrame([{
+                    "Section ID": f_section, "Defect Type": f_defect, "Severity": f_severity,
+                    "Area Affected (%)": f_area, "Notes / Photo Ref": f_notes,
+                }])
+                st.session_state.pci_input = pd.concat(
+                    [st.session_state.pci_input, new_row], ignore_index=True
+                )
+                st.success(f"Added: Section {f_section} — {f_defect} ({f_severity}, {f_area}%)")
+
+    with form_col2:
+        st.markdown("**Add an IRI roughness reading**")
+        with st.form("add_iri_form", clear_on_submit=True):
+            existing_iri_sections = sorted(set(
+                pd.to_numeric(st.session_state.iri_input["Section ID"], errors="coerce").dropna().astype(int).tolist()
+            )) or [1]
+            g_section = st.number_input(
+                "Section ID", min_value=1, max_value=999,
+                value=int(max(existing_iri_sections)) if existing_iri_sections else 1, step=1,
+                key="iri_form_section",
+            )
+            g_segment = st.number_input("Segment ID", min_value=1, max_value=50, value=1, step=1)
+            g_start = st.number_input("Start Chainage (m)", min_value=0, value=0, step=10)
+            g_end = st.number_input("End Chainage (m)", min_value=0, value=20, step=10)
+            g_iri = st.slider("IRI (m/km)", 0.0, 10.0, 2.0, step=0.05)
+            g_notes = st.text_input("Notes (optional)", "", key="iri_form_notes")
+            submitted_iri = st.form_submit_button("➕ Add IRI Reading", use_container_width=True)
+            if submitted_iri:
+                new_row = pd.DataFrame([{
+                    "Section ID": g_section, "Segment ID": g_segment,
+                    "Start Chainage (m)": g_start, "End Chainage (m)": g_end,
+                    "IRI (m/km)": g_iri, "Notes": g_notes,
+                }])
+                st.session_state.iri_input = pd.concat(
+                    [st.session_state.iri_input, new_row], ignore_index=True
+                )
+                st.success(f"Added: Section {g_section}, Segment {g_segment} — IRI {g_iri} m/km")
+
+    st.divider()
+
+    # =======================================================================
+    # SECTION C: Review & edit everything (collapsed, power-user table view)
+    # =======================================================================
+    with st.expander("📋 Review & Edit All Data (table view)", expanded=False):
+        st.caption("Bulk-edit or delete rows directly. Changes here apply immediately to results.")
+        rcol1, rcol2 = st.columns(2)
+        with rcol1:
+            st.markdown("**PCI Input — Defect Records**")
+            st.session_state.pci_input = st.data_editor(
+                st.session_state.pci_input,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "Defect Type": st.column_config.SelectboxColumn(
+                        options=list(st.session_state.defect_weights.keys())
+                    ),
+                    "Severity": st.column_config.SelectboxColumn(
+                        options=list(st.session_state.severity_factors.keys())
+                    ),
+                    "Area Affected (%)": st.column_config.NumberColumn(min_value=0, max_value=100, step=0.1),
+                },
+                key="pci_editor",
+            )
+        with rcol2:
+            st.markdown("**IRI Input — Roughness Readings**")
+            st.session_state.iri_input = st.data_editor(
+                st.session_state.iri_input,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "IRI (m/km)": st.column_config.NumberColumn(min_value=0, max_value=20, step=0.01),
+                },
+                key="iri_editor",
+            )
 
     st.info(
-        "💡 Tip for demo: try changing a Severity or Area Affected (%) value above, "
-        "then check the Results and Dashboard tabs — they update instantly."
+        "💡 Tip for demo: add a new defect via the form above, or edit a value in the "
+        "review table, then check the Results and Dashboard tabs — they update instantly."
     )
 
 
