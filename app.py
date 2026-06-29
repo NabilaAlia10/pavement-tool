@@ -59,7 +59,7 @@ def colored_condition_table(df: pd.DataFrame, cond_cols: list) -> "pd.io.formats
     sty = df.style
     for c in cond_cols:
         if c in df.columns:
-            sty = sty.applymap(style_cond, subset=[c])
+            sty = sty.map(style_cond, subset=[c])
     return sty
 
 
