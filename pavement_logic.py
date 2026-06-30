@@ -196,3 +196,130 @@ def bands_to_dataframe(bands: list, value_label: str) -> pd.DataFrame:
 def dataframe_to_bands(df: pd.DataFrame) -> list:
     """Helper to convert an edited dataframe back into a band list."""
     return [tuple(row) for row in df.itertuples(index=False, name=None)]
+
+
+# ---------------------------------------------------------------------------
+# Hybrid reasoning — explain WHY the hybrid condition was chosen
+# ---------------------------------------------------------------------------
+
+def hybrid_reasoning(row: pd.Series) -> str:
+    """Generate a one-line, human-readable explanation of why a section's
+    Hybrid condition was selected, given its PCI and IRI classifications."""
+    pci_cond = row.get("PCI Condition")
+    iri_cond = row.get("IRI Condition")
+    hybrid_cond = row.get("Hybrid Condition")
+    pci_val = row.get("PCI")
+    iri_val = row.get("Avg IRI (m/km)")
+
+    if pd.isna(pci_cond) and pd.isna(iri_cond):
+        return "No PCI or IRI data available for this section."
+    if pd.isna(pci_cond):
+        return f"Only IRI data available ({iri_val:.2f} m/km) — classified as {hybrid_cond} based on roughness alone."
+    if pd.isna(iri_cond):
+        return f"Only PCI data available ({pci_val:.1f}) — classified as {hybrid_cond} based on visible defects alone."
+
+    if pci_cond == iri_cond:
+        return f"PCI ({pci_val:.1f}, {pci_cond}) and IRI ({iri_val:.2f} m/km, {iri_cond}) agree — both indicate {hybrid_cond} condition."
+
+    rank = {"Very Good": 0, "Good": 1, "Fair": 2, "Poor": 3}
+    if rank.get(pci_cond, 0) > rank.get(iri_cond, 0):
+        return (
+            f"PCI ({pci_val:.1f}, {pci_cond}) is worse than IRI ({iri_val:.2f} m/km, {iri_cond}) — "
+            f"visible surface defects outweigh the roughness reading, so the section is classified as {hybrid_cond}."
+        )
+    else:
+        return (
+            f"IRI ({iri_val:.2f} m/km, {iri_cond}) is worse than PCI ({pci_val:.1f}, {pci_cond}) — "
+            f"the ride is rougher than visible defects suggest (possible subsurface issue), so the section is classified as {hybrid_cond}."
+        )
+
+
+def add_hybrid_reasoning(hybrid_df: pd.DataFrame) -> pd.DataFrame:
+    """Add a 'Why' column explaining each section's hybrid classification."""
+    df = hybrid_df.copy()
+    df["Why"] = df.apply(hybrid_reasoning, axis=1)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Maintenance cost estimation
+# ---------------------------------------------------------------------------
+
+DEFAULT_COST_PER_100M = {
+    "Routine maintenance (cleaning, grass cutting, minor touch-ups)": 500,
+    "Routine maintenance": 500,
+    "Preventive maintenance (crack sealing, local patching)": 3000,
+    "Preventive maintenance (localized patching/leveling)": 3000,
+    "Surface treatment / Overlay (localized)": 12000,
+    "Surface treatment / thin overlay": 12000,
+    "Major rehabilitation / Reconstruction assessment": 45000,
+    "Structural overlay / rehabilitation": 45000,
+}
+
+
+def estimate_costs(summary_df: pd.DataFrame, rec_col: str, cost_map: dict = None) -> pd.DataFrame:
+    """Add an 'Estimated Cost (RM)' column based on each section's recommended
+    maintenance action. Assumes 100m sections; cost_map gives RM per 100m
+    section for each action category (editable by the user)."""
+    cost_map = cost_map or DEFAULT_COST_PER_100M
+    df = summary_df.copy()
+    df["Estimated Cost (RM)"] = df[rec_col].map(cost_map).fillna(0)
+    return df
+
+
+def cost_scenario(cost_df: pd.DataFrame, cond_col: str, budget: float) -> pd.DataFrame:
+    """Given a budget (RM), select the highest-priority sections (worst
+    condition first) that fit within budget, cumulative-summing cost."""
+    rank = {"Poor": 0, "Fair": 1, "Good": 2, "Very Good": 3}
+    df = cost_df.copy()
+    df["_rank"] = df[cond_col].map(rank)
+    df = df.sort_values(["_rank", "Estimated Cost (RM)"], ascending=[True, False])
+    df["Cumulative Cost (RM)"] = df["Estimated Cost (RM)"].cumsum()
+    df["Within Budget"] = df["Cumulative Cost (RM)"] <= budget
+    return df.drop(columns="_rank").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Before / After maintenance simulator
+# ---------------------------------------------------------------------------
+
+# Assumed PCI recovery and IRI improvement per maintenance action, based on
+# typical pavement management literature (simplified for course use).
+ACTION_EFFECTS = {
+    "Routine maintenance (cleaning, grass cutting, minor touch-ups)": {"pci_to": None, "iri_factor": 1.0},
+    "Routine maintenance": {"pci_to": None, "iri_factor": 1.0},
+    "Preventive maintenance (crack sealing, local patching)": {"pci_to": 88, "iri_factor": 0.9},
+    "Preventive maintenance (localized patching/leveling)": {"pci_to": 88, "iri_factor": 0.85},
+    "Surface treatment / Overlay (localized)": {"pci_to": 90, "iri_factor": 0.6},
+    "Surface treatment / thin overlay": {"pci_to": 90, "iri_factor": 0.55},
+    "Major rehabilitation / Reconstruction assessment": {"pci_to": 97, "iri_factor": 0.3},
+    "Structural overlay / rehabilitation": {"pci_to": 97, "iri_factor": 0.25},
+}
+
+
+def simulate_maintenance(current_pci: float, current_iri: float, action: str,
+                          pci_bands: list = None, iri_bands: list = None) -> dict:
+    """Project the PCI and IRI of a section AFTER a given maintenance action
+    is applied, using simplified recovery assumptions. Returns before/after
+    values and condition classes for both indices."""
+    pci_bands = pci_bands or DEFAULT_PCI_BANDS
+    iri_bands = iri_bands or DEFAULT_IRI_BANDS
+
+    effect = ACTION_EFFECTS.get(action, {"pci_to": None, "iri_factor": 1.0})
+
+    new_pci = effect["pci_to"] if effect["pci_to"] is not None else current_pci
+    new_pci = max(current_pci, new_pci)  # maintenance never makes it worse
+    new_iri = round(current_iri * effect["iri_factor"], 2)
+
+    before_pci_cls, _ = classify(current_pci, pci_bands)
+    after_pci_cls, _ = classify(new_pci, pci_bands)
+    before_iri_cls, _ = classify(current_iri, iri_bands)
+    after_iri_cls, _ = classify(new_iri, iri_bands)
+
+    return {
+        "before_pci": current_pci, "after_pci": round(new_pci, 1),
+        "before_pci_class": before_pci_cls, "after_pci_class": normalize_condition_label(after_pci_cls),
+        "before_iri": current_iri, "after_iri": new_iri,
+        "before_iri_class": normalize_condition_label(before_iri_cls),
+        "after_iri_class": normalize_condition_label(after_iri_cls),
+    }
