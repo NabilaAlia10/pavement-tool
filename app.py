@@ -460,48 +460,55 @@ with tab_results:
         final_cond_col = "Hybrid Condition"
 
     # -----------------------------------------------------------------
-    # Filters
+    # Filters (fully opt-in — table shows everything until user turns this on)
     # -----------------------------------------------------------------
-    with st.expander("🔎 Filters", expanded=True):
-        fc1, fc2, fc3 = st.columns(3)
+    use_filters = st.toggle("🔎 Filter results", value=False,
+                             help="Turn on to narrow down the table by section, condition, or defect type.")
 
-        all_sections = sorted(display_df["Section ID"].dropna().astype(int).unique().tolist())
+    all_sections = sorted(display_df["Section ID"].dropna().astype(int).unique().tolist())
+    all_defects = sorted(st.session_state.pci_input["Defect Type"].dropna().unique().tolist()) if mode != "IRI" else []
+
+    if use_filters:
+        fc1, fc2, fc3 = st.columns(3)
         with fc1:
             sel_sections = st.multiselect(
-                "Section ID", options=all_sections, default=all_sections,
-                help="Show only these sections",
+                "Section ID", options=all_sections, default=[],
+                placeholder="All sections",
+                help="Leave empty to include all sections, or pick specific ones",
             )
-
         with fc2:
             sel_conditions = st.multiselect(
-                "Condition", options=["Very Good", "Good", "Fair", "Poor"],
-                default=["Very Good", "Good", "Fair", "Poor"],
-                help="Show only sections with this final condition",
+                "Condition", options=["Very Good", "Good", "Fair", "Poor"], default=[],
+                placeholder="All conditions",
+                help="Leave empty to include all conditions, or pick specific ones",
             )
-
         with fc3:
             if mode != "IRI":
-                all_defects = sorted(st.session_state.pci_input["Defect Type"].dropna().unique().tolist())
                 sel_defects = st.multiselect(
-                    "Defect Type present", options=all_defects, default=all_defects,
-                    help="Show only sections that have at least one of the selected defect types",
+                    "Defect Type present", options=all_defects, default=[],
+                    placeholder="All defect types",
+                    help="Leave empty to include all defect types, or pick specific ones",
                 )
             else:
-                sel_defects = None
+                sel_defects = []
                 st.caption("Defect type filter is only available in PCI / Hybrid mode.")
+    else:
+        sel_sections, sel_conditions, sel_defects = [], [], []
 
-    # Apply filters
-    filtered_df = display_df[
-        display_df["Section ID"].isin(sel_sections) & display_df[final_cond_col].isin(sel_conditions)
-    ].copy()
-
-    if sel_defects is not None and len(sel_defects) < len(sorted(st.session_state.pci_input["Defect Type"].dropna().unique().tolist())):
+    # Apply filters — an empty selection means "no constraint" on that field
+    filtered_df = display_df.copy()
+    if sel_sections:
+        filtered_df = filtered_df[filtered_df["Section ID"].isin(sel_sections)]
+    if sel_conditions:
+        filtered_df = filtered_df[filtered_df[final_cond_col].isin(sel_conditions)]
+    if sel_defects:
         sections_with_defect = st.session_state.pci_input[
             st.session_state.pci_input["Defect Type"].isin(sel_defects)
         ]["Section ID"].dropna().astype(int).unique().tolist()
         filtered_df = filtered_df[filtered_df["Section ID"].isin(sections_with_defect)]
 
-    st.caption(f"Showing {len(filtered_df)} of {len(display_df)} sections")
+    if use_filters and (sel_sections or sel_conditions or sel_defects):
+        st.caption(f"Showing {len(filtered_df)} of {len(display_df)} sections")
 
     st.dataframe(
         colored_condition_table(filtered_df, cond_col),
