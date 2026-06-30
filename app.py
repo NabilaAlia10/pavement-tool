@@ -1,748 +1,325 @@
 """
-Digital Pavement Condition Evaluation and Maintenance Decision Tool
-TCG633 - Bridge and Road Maintenance | Individual Project
+Core pavement evaluation logic for the Digital Pavement Condition Evaluation Tool.
+TCG633 - Bridge and Road Maintenance
 
-Run with:  streamlit run app.py
+This module contains the engineering calculations, kept separate from the
+Streamlit UI so the logic can be tested independently and is easy to explain
+in the technical report / video.
 """
 
-import io
-import base64
 import pandas as pd
-import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
-
-from pavement_logic import (
-    DEFAULT_DEFECT_WEIGHTS, DEFAULT_SEVERITY_FACTORS,
-    DEFAULT_PCI_BANDS, DEFAULT_IRI_BANDS,
-    compute_pci, compute_iri, compute_hybrid,
-    bands_to_dataframe, dataframe_to_bands,
-)
 
 # ---------------------------------------------------------------------------
-# Page config & styling
+# Default lookup tables (editable via the app's sidebar)
+# Based on the lecturer-provided template, simplified from ASTM D6433's
+# curve-based deduct values into a linear weighted formula for course use.
 # ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Pavement Condition Evaluation Tool",
-    page_icon="🛣️",
-    layout="wide",
-)
 
-CONDITION_COLORS = {
-    "Very Good": "#2E7D32",
-    "Good": "#9E9D24",
-    "Fair": "#F57C00",
-    "Poor": "#C62828",
+DEFAULT_DEFECT_WEIGHTS = {
+    "Longitudinal Crack": 1.0,
+    "Alligator (Fatigue) Crack": 1.6,
+    "Potholes": 2.2,
+    "Raveling": 1.2,
+    "Depression/Sag": 1.4,
+    "Patching (Failed)": 1.8,
+    "Bleeding/Flushing": 1.0,
+    "Rut/Rutting": 1.6,
 }
 
-st.markdown("""
-<style>
-    .block-container {padding-top: 2rem;}
-    .condition-badge {
-        display: inline-block; padding: 2px 10px; border-radius: 12px;
-        font-weight: 600; font-size: 0.85rem; color: white;
+DEFAULT_SEVERITY_FACTORS = {
+    "Low": 0.6,
+    "Medium": 1.0,
+    "High": 1.4,
+}
+
+DEFAULT_PCI_BANDS = [
+    # (min, max, condition class, recommended maintenance)
+    (85, 100, "Very Good", "Routine maintenance (cleaning, grass cutting, minor touch-ups)"),
+    (70, 85, "Good", "Preventive maintenance (crack sealing, local patching)"),
+    (55, 70, "Fair", "Surface treatment / Overlay (localized)"),
+    (0, 55, "Poor", "Major rehabilitation / Reconstruction assessment"),
+]
+
+DEFAULT_IRI_BANDS = [
+    (0, 2, "Very Good (Smooth)", "Routine maintenance"),
+    (2, 3, "Good", "Preventive maintenance (localized patching/leveling)"),
+    (3, 4, "Fair", "Surface treatment / thin overlay"),
+    (4, 9999, "Poor (Rough)", "Structural overlay / rehabilitation"),
+]
+
+# Ordering used to decide which condition is "worse" for the Hybrid index.
+# Lower index = better condition.
+CONDITION_RANK = ["Very Good", "Good", "Fair", "Poor"]
+
+
+def classify(value: float, bands: list) -> tuple:
+    """Return (condition_class, recommendation) for a value given a band list.
+    Bands are checked from best to worst; value falls in [min, max)."""
+    for mn, mx, cls, rec in bands:
+        if mn <= value < mx:
+            return cls, rec
+    # Edge case: value exactly equals the top of the best band (e.g. PCI = 100)
+    last_mn, last_mx, last_cls, last_rec = bands[0]
+    if value >= last_mn:
+        return last_cls, last_rec
+    # Fallback: worst band
+    cls, rec = bands[-1][2], bands[-1][3]
+    return cls, rec
+
+
+def normalize_condition_label(label: str) -> str:
+    """Map IRI labels like 'Very Good (Smooth)' to the common 4-class scale."""
+    for base in CONDITION_RANK:
+        if label.startswith(base):
+            return base
+    return label
+
+
+def compute_pci(pci_input_df: pd.DataFrame,
+                 defect_weights: dict = None,
+                 severity_factors: dict = None,
+                 pci_bands: list = None) -> pd.DataFrame:
+    """
+    Compute PCI per section from raw defect input data.
+
+    pci_input_df columns required: 'Section ID', 'Defect Type', 'Severity',
+    'Area Affected (%)'
+
+    Returns a DataFrame with one row per Section ID:
+    Section ID, Sum Deduct, PCI, PCI Condition, PCI Recommendation
+    """
+    defect_weights = defect_weights or DEFAULT_DEFECT_WEIGHTS
+    severity_factors = severity_factors or DEFAULT_SEVERITY_FACTORS
+    pci_bands = pci_bands or DEFAULT_PCI_BANDS
+
+    df = pci_input_df.dropna(subset=["Section ID", "Defect Type", "Severity", "Area Affected (%)"]).copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Section ID", "Sum Deduct", "PCI", "PCI Condition", "PCI Recommendation"])
+
+    df["Weighting Factor"] = df["Defect Type"].map(defect_weights)
+    df["Severity Factor"] = df["Severity"].map(severity_factors)
+    df["Deduct Value"] = df["Weighting Factor"] * df["Severity Factor"] * df["Area Affected (%)"]
+
+    summary = df.groupby("Section ID", as_index=False)["Deduct Value"].sum()
+    summary = summary.rename(columns={"Deduct Value": "Sum Deduct"})
+    summary["PCI"] = (100 - summary["Sum Deduct"]).clip(lower=0).round(1)
+
+    results = summary["PCI"].apply(lambda v: classify(v, pci_bands))
+    summary["PCI Condition"] = results.apply(lambda r: r[0])
+    summary["PCI Recommendation"] = results.apply(lambda r: r[1])
+
+    return summary.sort_values("Section ID").reset_index(drop=True)
+
+
+def compute_iri(iri_input_df: pd.DataFrame,
+                 iri_bands: list = None) -> pd.DataFrame:
+    """
+    Compute average IRI per section from segment-level readings.
+
+    iri_input_df columns required: 'Section ID', 'IRI (m/km)'
+
+    Returns a DataFrame with one row per Section ID:
+    Section ID, Avg IRI (m/km), IRI Condition, IRI Recommendation
+    """
+    iri_bands = iri_bands or DEFAULT_IRI_BANDS
+
+    df = iri_input_df.dropna(subset=["Section ID", "IRI (m/km)"]).copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Section ID", "Avg IRI (m/km)", "IRI Condition", "IRI Recommendation"])
+
+    summary = df.groupby("Section ID", as_index=False)["IRI (m/km)"].mean()
+    summary["Avg IRI (m/km)"] = summary["IRI (m/km)"].round(2)
+    summary = summary.drop(columns=["IRI (m/km)"])
+
+    results = summary["Avg IRI (m/km)"].apply(lambda v: classify(v, iri_bands))
+    summary["IRI Condition"] = results.apply(lambda r: normalize_condition_label(r[0]))
+    summary["IRI Recommendation"] = results.apply(lambda r: r[1])
+
+    return summary.sort_values("Section ID").reset_index(drop=True)
+
+
+def compute_hybrid(pci_summary: pd.DataFrame, iri_summary: pd.DataFrame,
+                    pci_bands: list = None, iri_bands: list = None) -> pd.DataFrame:
+    """
+    Merge PCI and IRI results per section and compute a Hybrid condition:
+    the MORE CONSERVATIVE (worse) of the two classifications, per standard
+    engineering judgment (visual defects and roughness can disagree; the
+    worse-condition reading should drive the maintenance decision).
+    """
+    pci_bands = pci_bands or DEFAULT_PCI_BANDS
+    iri_bands = iri_bands or DEFAULT_IRI_BANDS
+
+    merged = pd.merge(pci_summary, iri_summary, on="Section ID", how="outer").sort_values("Section ID")
+
+    def worse_of(pci_cond, iri_cond):
+        if pd.isna(pci_cond) and pd.isna(iri_cond):
+            return None
+        if pd.isna(pci_cond):
+            return iri_cond
+        if pd.isna(iri_cond):
+            return pci_cond
+        rank_pci = CONDITION_RANK.index(pci_cond) if pci_cond in CONDITION_RANK else 0
+        rank_iri = CONDITION_RANK.index(iri_cond) if iri_cond in CONDITION_RANK else 0
+        return pci_cond if rank_pci >= rank_iri else iri_cond
+
+    merged["Hybrid Condition"] = merged.apply(
+        lambda r: worse_of(r.get("PCI Condition"), r.get("IRI Condition")), axis=1
+    )
+
+    # Recommendation follows the hybrid condition, sourced from whichever
+    # index produced that worse classification, falling back to PCI bands.
+    rec_lookup = {cls: rec for _, _, cls, rec in pci_bands}
+    rec_lookup_iri = {normalize_condition_label(cls): rec for _, _, cls, rec in iri_bands}
+
+    def hybrid_rec(cond, pci_cond, iri_cond, pci_rec, iri_rec):
+        if cond == pci_cond:
+            return pci_rec
+        if cond == iri_cond:
+            return iri_rec
+        return rec_lookup.get(cond, "")
+
+    merged["Hybrid Recommendation"] = merged.apply(
+        lambda r: hybrid_rec(
+            r.get("Hybrid Condition"), r.get("PCI Condition"), r.get("IRI Condition"),
+            r.get("PCI Recommendation"), r.get("IRI Recommendation")
+        ), axis=1
+    )
+
+    return merged.reset_index(drop=True)
+
+
+def bands_to_dataframe(bands: list, value_label: str) -> pd.DataFrame:
+    """Helper to display a band list as an editable dataframe in the UI."""
+    return pd.DataFrame(bands, columns=[f"{value_label} Min", f"{value_label} Max", "Condition Class", "Recommended Maintenance"])
+
+
+def dataframe_to_bands(df: pd.DataFrame) -> list:
+    """Helper to convert an edited dataframe back into a band list."""
+    return [tuple(row) for row in df.itertuples(index=False, name=None)]
+
+
+# ---------------------------------------------------------------------------
+# Hybrid reasoning — explain WHY the hybrid condition was chosen
+# ---------------------------------------------------------------------------
+
+def hybrid_reasoning(row: pd.Series) -> str:
+    """Generate a one-line, human-readable explanation of why a section's
+    Hybrid condition was selected, given its PCI and IRI classifications."""
+    pci_cond = row.get("PCI Condition")
+    iri_cond = row.get("IRI Condition")
+    hybrid_cond = row.get("Hybrid Condition")
+    pci_val = row.get("PCI")
+    iri_val = row.get("Avg IRI (m/km)")
+
+    if pd.isna(pci_cond) and pd.isna(iri_cond):
+        return "No PCI or IRI data available for this section."
+    if pd.isna(pci_cond):
+        return f"Only IRI data available ({iri_val:.2f} m/km) — classified as {hybrid_cond} based on roughness alone."
+    if pd.isna(iri_cond):
+        return f"Only PCI data available ({pci_val:.1f}) — classified as {hybrid_cond} based on visible defects alone."
+
+    if pci_cond == iri_cond:
+        return f"PCI ({pci_val:.1f}, {pci_cond}) and IRI ({iri_val:.2f} m/km, {iri_cond}) agree — both indicate {hybrid_cond} condition."
+
+    rank = {"Very Good": 0, "Good": 1, "Fair": 2, "Poor": 3}
+    if rank.get(pci_cond, 0) > rank.get(iri_cond, 0):
+        return (
+            f"PCI ({pci_val:.1f}, {pci_cond}) is worse than IRI ({iri_val:.2f} m/km, {iri_cond}) — "
+            f"visible surface defects outweigh the roughness reading, so the section is classified as {hybrid_cond}."
+        )
+    else:
+        return (
+            f"IRI ({iri_val:.2f} m/km, {iri_cond}) is worse than PCI ({pci_val:.1f}, {pci_cond}) — "
+            f"the ride is rougher than visible defects suggest (possible subsurface issue), so the section is classified as {hybrid_cond}."
+        )
+
+
+def add_hybrid_reasoning(hybrid_df: pd.DataFrame) -> pd.DataFrame:
+    """Add a 'Why' column explaining each section's hybrid classification."""
+    df = hybrid_df.copy()
+    df["Why"] = df.apply(hybrid_reasoning, axis=1)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Maintenance cost estimation
+# ---------------------------------------------------------------------------
+
+DEFAULT_COST_PER_100M = {
+    "Routine maintenance (cleaning, grass cutting, minor touch-ups)": 500,
+    "Routine maintenance": 500,
+    "Preventive maintenance (crack sealing, local patching)": 3000,
+    "Preventive maintenance (localized patching/leveling)": 3000,
+    "Surface treatment / Overlay (localized)": 12000,
+    "Surface treatment / thin overlay": 12000,
+    "Major rehabilitation / Reconstruction assessment": 45000,
+    "Structural overlay / rehabilitation": 45000,
+}
+
+
+def estimate_costs(summary_df: pd.DataFrame, rec_col: str, cost_map: dict = None) -> pd.DataFrame:
+    """Add an 'Estimated Cost (RM)' column based on each section's recommended
+    maintenance action. Assumes 100m sections; cost_map gives RM per 100m
+    section for each action category (editable by the user)."""
+    cost_map = cost_map or DEFAULT_COST_PER_100M
+    df = summary_df.copy()
+    df["Estimated Cost (RM)"] = df[rec_col].map(cost_map).fillna(0)
+    return df
+
+
+def cost_scenario(cost_df: pd.DataFrame, cond_col: str, budget: float) -> pd.DataFrame:
+    """Given a budget (RM), select the highest-priority sections (worst
+    condition first) that fit within budget, cumulative-summing cost."""
+    rank = {"Poor": 0, "Fair": 1, "Good": 2, "Very Good": 3}
+    df = cost_df.copy()
+    df["_rank"] = df[cond_col].map(rank)
+    df = df.sort_values(["_rank", "Estimated Cost (RM)"], ascending=[True, False])
+    df["Cumulative Cost (RM)"] = df["Estimated Cost (RM)"].cumsum()
+    df["Within Budget"] = df["Cumulative Cost (RM)"] <= budget
+    return df.drop(columns="_rank").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Before / After maintenance simulator
+# ---------------------------------------------------------------------------
+
+# Assumed PCI recovery and IRI improvement per maintenance action, based on
+# typical pavement management literature (simplified for course use).
+ACTION_EFFECTS = {
+    "Routine maintenance (cleaning, grass cutting, minor touch-ups)": {"pci_to": None, "iri_factor": 1.0},
+    "Routine maintenance": {"pci_to": None, "iri_factor": 1.0},
+    "Preventive maintenance (crack sealing, local patching)": {"pci_to": 88, "iri_factor": 0.9},
+    "Preventive maintenance (localized patching/leveling)": {"pci_to": 88, "iri_factor": 0.85},
+    "Surface treatment / Overlay (localized)": {"pci_to": 90, "iri_factor": 0.6},
+    "Surface treatment / thin overlay": {"pci_to": 90, "iri_factor": 0.55},
+    "Major rehabilitation / Reconstruction assessment": {"pci_to": 97, "iri_factor": 0.3},
+    "Structural overlay / rehabilitation": {"pci_to": 97, "iri_factor": 0.25},
+}
+
+
+def simulate_maintenance(current_pci: float, current_iri: float, action: str,
+                          pci_bands: list = None, iri_bands: list = None) -> dict:
+    """Project the PCI and IRI of a section AFTER a given maintenance action
+    is applied, using simplified recovery assumptions. Returns before/after
+    values and condition classes for both indices."""
+    pci_bands = pci_bands or DEFAULT_PCI_BANDS
+    iri_bands = iri_bands or DEFAULT_IRI_BANDS
+
+    effect = ACTION_EFFECTS.get(action, {"pci_to": None, "iri_factor": 1.0})
+
+    new_pci = effect["pci_to"] if effect["pci_to"] is not None else current_pci
+    new_pci = max(current_pci, new_pci)  # maintenance never makes it worse
+    new_iri = round(current_iri * effect["iri_factor"], 2)
+
+    before_pci_cls, _ = classify(current_pci, pci_bands)
+    after_pci_cls, _ = classify(new_pci, pci_bands)
+    before_iri_cls, _ = classify(current_iri, iri_bands)
+    after_iri_cls, _ = classify(new_iri, iri_bands)
+
+    return {
+        "before_pci": current_pci, "after_pci": round(new_pci, 1),
+        "before_pci_class": before_pci_cls, "after_pci_class": normalize_condition_label(after_pci_cls),
+        "before_iri": current_iri, "after_iri": new_iri,
+        "before_iri_class": normalize_condition_label(before_iri_cls),
+        "after_iri_class": normalize_condition_label(after_iri_cls),
     }
-    div[data-testid="stMetricValue"] { font-size: 1.8rem; }
-    h1, h2, h3 { font-family: 'Source Sans Pro', sans-serif; }
-</style>
-""", unsafe_allow_html=True)
-
-
-def colored_condition_table(df: pd.DataFrame, cond_cols: list) -> "pd.io.formats.style.Styler":
-    """Apply background color to condition columns for visual scanning."""
-    def style_cond(val):
-        base = str(val).split(" ")[0] if val else ""
-        for k in CONDITION_COLORS:
-            if str(val).startswith(k):
-                color = CONDITION_COLORS[k]
-                return f"background-color: {color}22; color: {color}; font-weight: 600;"
-        return ""
-    sty = df.style
-    for c in cond_cols:
-        if c in df.columns:
-            sty = sty.map(style_cond, subset=[c])
-    return sty
-
-
-# ---------------------------------------------------------------------------
-# Sidebar: data source, mode, lookup editing
-# ---------------------------------------------------------------------------
-st.sidebar.title("🛣️ Tool Controls")
-
-st.sidebar.subheader("1. Data Source")
-data_source = st.sidebar.radio(
-    "Choose data source",
-    ["Use built-in sample dataset", "Upload my own file"],
-    index=0,
-)
-
-uploaded_file = None
-if data_source == "Upload my own file":
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload Excel (.xlsx) with 'PCI_Input' and 'IRI_Input' sheets, or two CSVs",
-        type=["xlsx", "csv"],
-    )
-
-st.sidebar.subheader("2. Evaluation Mode")
-mode = st.sidebar.radio("Select mode", ["PCI", "IRI", "Hybrid (PCI + IRI)"], index=2)
-
-with st.sidebar.expander("3. Edit Lookup Tables (advanced)"):
-    st.caption("Adjust weighting/severity factors and condition bands to match your standard.")
-    edit_lookup = st.checkbox("Enable lookup editing", value=False)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("TCG633 Bridge & Road Maintenance — Individual Project")
-st.sidebar.caption("Digital Pavement Condition Evaluation and Maintenance Decision Tool")
-
-
-# ---------------------------------------------------------------------------
-# Load default sample data
-# ---------------------------------------------------------------------------
-@st.cache_data
-def load_default_data():
-    pci = pd.read_csv("sample_data/pci_input.csv")
-    iri = pd.read_csv("sample_data/iri_input.csv")
-    return pci, iri
-
-
-def _find_header_row(xls, sheet_name, key_col="Section ID", scan_rows=10):
-    """Find the row index containing the real column headers, since our
-    dataset sheets have title/subtitle rows above the header."""
-    preview = pd.read_excel(xls, sheet_name=sheet_name, header=None, nrows=scan_rows)
-    for i, row in preview.iterrows():
-        if key_col in row.values:
-            return i
-    return 0
-
-
-def load_uploaded_data(file):
-    if file.name.endswith(".xlsx"):
-        xls = pd.ExcelFile(file)
-        pci_header = _find_header_row(xls, "PCI_Input")
-        iri_header = _find_header_row(xls, "IRI_Input")
-        pci = pd.read_excel(xls, sheet_name="PCI_Input", header=pci_header)
-        iri = pd.read_excel(xls, sheet_name="IRI_Input", header=iri_header)
-        # Drop any stray fully-blank rows and ensure Section ID is numeric
-        pci = pci[pd.to_numeric(pci["Section ID"], errors="coerce").notna()]
-        iri = iri[pd.to_numeric(iri["Section ID"], errors="coerce").notna()]
-        return pci, iri
-    else:
-        st.sidebar.warning("CSV upload: please upload PCI_Input first, then IRI_Input separately below.")
-        return None, None
-
-
-if data_source == "Upload my own file" and uploaded_file is not None:
-    pci_input_raw, iri_input_raw = load_uploaded_data(uploaded_file)
-    if pci_input_raw is None:
-        st.stop()
-else:
-    pci_input_raw, iri_input_raw = load_default_data()
-
-if "pci_input" not in st.session_state:
-    st.session_state.pci_input = pci_input_raw.copy()
-if "iri_input" not in st.session_state:
-    st.session_state.iri_input = iri_input_raw.copy()
-
-# Ensure Notes/Photo columns always exist (old datasets may only have "Notes / Photo Ref")
-if "Notes / Photo Ref" in st.session_state.pci_input.columns and "Notes" not in st.session_state.pci_input.columns:
-    st.session_state.pci_input = st.session_state.pci_input.rename(columns={"Notes / Photo Ref": "Notes"})
-if "Notes" not in st.session_state.pci_input.columns:
-    st.session_state.pci_input["Notes"] = ""
-if "Photo" not in st.session_state.pci_input.columns:
-    st.session_state.pci_input["Photo"] = ""
-
-# Reset session data if a new file is uploaded
-if data_source == "Upload my own file" and uploaded_file is not None:
-    if st.sidebar.button("Reload uploaded data"):
-        st.session_state.pci_input = pci_input_raw.copy()
-        st.session_state.iri_input = iri_input_raw.copy()
-
-
-# ---------------------------------------------------------------------------
-# Lookup table state
-# ---------------------------------------------------------------------------
-if "defect_weights" not in st.session_state:
-    st.session_state.defect_weights = DEFAULT_DEFECT_WEIGHTS.copy()
-if "severity_factors" not in st.session_state:
-    st.session_state.severity_factors = DEFAULT_SEVERITY_FACTORS.copy()
-if "pci_bands" not in st.session_state:
-    st.session_state.pci_bands = DEFAULT_PCI_BANDS.copy()
-if "iri_bands" not in st.session_state:
-    st.session_state.iri_bands = DEFAULT_IRI_BANDS.copy()
-
-if edit_lookup:
-    with st.sidebar.expander("Defect Weighting Factors", expanded=False):
-        for k in list(st.session_state.defect_weights.keys()):
-            st.session_state.defect_weights[k] = st.number_input(
-                k, value=float(st.session_state.defect_weights[k]), step=0.1, key=f"w_{k}"
-            )
-    with st.sidebar.expander("Severity Factors", expanded=False):
-        for k in list(st.session_state.severity_factors.keys()):
-            st.session_state.severity_factors[k] = st.number_input(
-                k, value=float(st.session_state.severity_factors[k]), step=0.1, key=f"s_{k}"
-            )
-
-
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-st.title("🛣️ Digital Pavement Condition Evaluation and Maintenance Decision Tool")
-st.caption(
-    "District JKR Maintenance Division — Secondary Road Network Assessment "
-    "| PCI (ASTM D6433-based) & IRI (Roughness) Evaluation"
-)
-
-tab_input, tab_results, tab_dashboard, tab_about = st.tabs(
-    ["📥 Data Input", "📊 Computation & Results", "📈 Dashboard", "ℹ️ Methodology"]
-)
-
-# ---------------------------------------------------------------------------
-# TAB 1: Data Input
-# ---------------------------------------------------------------------------
-with tab_input:
-    st.subheader("Pavement Condition Input Data")
-    st.caption("Add a defect or roughness reading below. Results update automatically.")
-
-    # =======================================================================
-    # SECTION A: Add a record (form-based entry) — PRIMARY WORKFLOW
-    # =======================================================================
-    entry_type = st.radio(
-        "What would you like to add?",
-        ["PCI defect observation", "IRI roughness reading"],
-        horizontal=True,
-        key="entry_type_choice",
-    )
-
-    if entry_type == "PCI defect observation":
-        with st.form("add_pci_form", clear_on_submit=True):
-            existing_sections = sorted(set(
-                pd.to_numeric(st.session_state.pci_input["Section ID"], errors="coerce").dropna().astype(int).tolist()
-            ))
-            section_choices = [str(s) for s in existing_sections] + ["+ New Section"]
-            c1, c2 = st.columns(2)
-            with c1:
-                f_section_choice = st.selectbox(
-                    "Section ID", section_choices,
-                    index=len(section_choices) - 2 if existing_sections else 0,
-                )
-                if f_section_choice == "+ New Section":
-                    f_section = st.number_input(
-                        "New Section ID", min_value=1, max_value=999,
-                        value=(max(existing_sections) + 1) if existing_sections else 1, step=1,
-                    )
-                else:
-                    f_section = int(f_section_choice)
-                f_defect = st.selectbox("Defect Type", list(st.session_state.defect_weights.keys()))
-            with c2:
-                f_severity = st.selectbox("Severity", list(st.session_state.severity_factors.keys()), index=1)
-                f_area = st.number_input("Area Affected (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
-            f_notes = st.text_input("Notes (optional)", "")
-            f_photo = st.file_uploader(
-                "📷 Attach a photo (optional)", type=["png", "jpg", "jpeg"], key="pci_photo_upload"
-            )
-            submitted_pci = st.form_submit_button("➕ Add PCI Entry", use_container_width=True, type="primary")
-            if submitted_pci:
-                photo_data_uri = ""
-                if f_photo is not None:
-                    img_bytes = f_photo.getvalue()
-                    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-                    mime = "image/png" if f_photo.type == "image/png" else "image/jpeg"
-                    photo_data_uri = f"data:{mime};base64,{img_b64}"
-                new_row = pd.DataFrame([{
-                    "Section ID": f_section, "Defect Type": f_defect, "Severity": f_severity,
-                    "Area Affected (%)": f_area, "Notes": f_notes, "Photo": photo_data_uri,
-                }])
-                st.session_state.pci_input = pd.concat(
-                    [st.session_state.pci_input, new_row], ignore_index=True
-                )
-                st.success(f"Added: Section {f_section} — {f_defect} ({f_severity}, {f_area}%)" + (" 📷" if photo_data_uri else ""))
-
-    else:
-        with st.form("add_iri_form", clear_on_submit=True):
-            existing_iri_sections = sorted(set(
-                pd.to_numeric(st.session_state.iri_input["Section ID"], errors="coerce").dropna().astype(int).tolist()
-            ))
-            iri_section_choices = [str(s) for s in existing_iri_sections] + ["+ New Section"]
-            c1, c2 = st.columns(2)
-            with c1:
-                g_section_choice = st.selectbox(
-                    "Section ID", iri_section_choices,
-                    index=len(iri_section_choices) - 2 if existing_iri_sections else 0,
-                    key="iri_form_section_choice",
-                )
-                if g_section_choice == "+ New Section":
-                    g_section = st.number_input(
-                        "New Section ID", min_value=1, max_value=999,
-                        value=(max(existing_iri_sections) + 1) if existing_iri_sections else 1, step=1,
-                        key="iri_form_new_section",
-                    )
-                else:
-                    g_section = int(g_section_choice)
-                g_segment = st.number_input("Segment ID", min_value=1, max_value=50, value=1, step=1)
-            with c2:
-                g_start = st.number_input("Start Chainage (m)", min_value=0, value=0, step=10)
-                g_end = st.number_input("End Chainage (m)", min_value=0, value=20, step=10)
-            g_iri = st.number_input("IRI (m/km)", min_value=0.0, max_value=10.0, value=2.0, step=0.05)
-            g_notes = st.text_input("Notes (optional)", "", key="iri_form_notes")
-            submitted_iri = st.form_submit_button("➕ Add IRI Reading", use_container_width=True, type="primary")
-            if submitted_iri:
-                new_row = pd.DataFrame([{
-                    "Section ID": g_section, "Segment ID": g_segment,
-                    "Start Chainage (m)": g_start, "End Chainage (m)": g_end,
-                    "IRI (m/km)": g_iri, "Notes": g_notes,
-                }])
-                st.session_state.iri_input = pd.concat(
-                    [st.session_state.iri_input, new_row], ignore_index=True
-                )
-                st.success(f"Added: Section {g_section}, Segment {g_segment} — IRI {g_iri} m/km")
-
-    st.divider()
-
-    # =======================================================================
-    # SECTION B: Review & edit everything (table view)
-    # =======================================================================
-    st.markdown("##### 📋 Current Data")
-    rtab1, rtab2 = st.tabs(["PCI Records", "IRI Readings"])
-    with rtab1:
-        st.session_state.pci_input = st.data_editor(
-            st.session_state.pci_input,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Defect Type": st.column_config.SelectboxColumn(
-                    options=list(st.session_state.defect_weights.keys())
-                ),
-                "Severity": st.column_config.SelectboxColumn(
-                    options=list(st.session_state.severity_factors.keys())
-                ),
-                "Area Affected (%)": st.column_config.NumberColumn(min_value=0, max_value=100, step=0.1),
-                "Photo": st.column_config.ImageColumn("Photo", help="Defect photo, if attached"),
-            },
-            key="pci_editor",
-        )
-    with rtab2:
-        st.session_state.iri_input = st.data_editor(
-            st.session_state.iri_input,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "IRI (m/km)": st.column_config.NumberColumn(min_value=0, max_value=20, step=0.01),
-            },
-            key="iri_editor",
-        )
-    st.caption("You can edit values or delete rows directly in the tables above.")
-
-    # =======================================================================
-    # SECTION C: Upload your own data (secondary, tucked away)
-    # =======================================================================
-    with st.expander("📤 Upload data from a file instead", expanded=False):
-        st.caption(
-            "Upload a CSV/Excel to replace the current data. "
-            "Need the format? Grab a blank template first."
-        )
-        up_col1, up_col2 = st.columns(2)
-
-        with up_col1:
-            st.markdown("**PCI defect data**")
-            pci_template = pd.DataFrame({
-                "Section ID": [1, 1],
-                "Defect Type": ["Potholes", "Longitudinal Crack"],
-                "Severity": ["Medium", "Low"],
-                "Area Affected (%)": [5.0, 3.0],
-                "Notes": ["", ""],
-            })
-            tmpl_buf = io.StringIO()
-            pci_template.to_csv(tmpl_buf, index=False)
-            st.download_button(
-                "⬇️ Download PCI template", tmpl_buf.getvalue(),
-                file_name="pci_template.csv", mime="text/csv", key="pci_tmpl_dl",
-            )
-            new_pci_file = st.file_uploader(
-                "Upload PCI defect data", type=["csv", "xlsx"], key="pci_upload_widget"
-            )
-            if new_pci_file is not None:
-                try:
-                    if new_pci_file.name.endswith(".csv"):
-                        new_pci_df = pd.read_csv(new_pci_file)
-                    else:
-                        new_pci_df = pd.read_excel(new_pci_file)
-                    required = {"Section ID", "Defect Type", "Severity", "Area Affected (%)"}
-                    if not required.issubset(set(new_pci_df.columns)):
-                        st.error(f"File must contain columns: {', '.join(required)}")
-                    else:
-                        if "Notes" not in new_pci_df.columns:
-                            new_pci_df["Notes"] = ""
-                        if "Photo" not in new_pci_df.columns:
-                            new_pci_df["Photo"] = ""
-                        if st.button("Replace PCI data with uploaded file", key="confirm_pci_replace"):
-                            st.session_state.pci_input = new_pci_df
-                            st.success(f"Loaded {len(new_pci_df)} PCI records.")
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"Could not read file: {e}")
-
-        with up_col2:
-            st.markdown("**IRI roughness data**")
-            iri_template = pd.DataFrame({
-                "Section ID": [1, 1],
-                "Segment ID": [1, 2],
-                "Start Chainage (m)": [0, 20],
-                "End Chainage (m)": [20, 40],
-                "IRI (m/km)": [2.1, 2.3],
-                "Notes": ["", ""],
-            })
-            tmpl_buf2 = io.StringIO()
-            iri_template.to_csv(tmpl_buf2, index=False)
-            st.download_button(
-                "⬇️ Download IRI template", tmpl_buf2.getvalue(),
-                file_name="iri_template.csv", mime="text/csv", key="iri_tmpl_dl",
-            )
-            new_iri_file = st.file_uploader(
-                "Upload IRI roughness data", type=["csv", "xlsx"], key="iri_upload_widget"
-            )
-            if new_iri_file is not None:
-                try:
-                    if new_iri_file.name.endswith(".csv"):
-                        new_iri_df = pd.read_csv(new_iri_file)
-                    else:
-                        new_iri_df = pd.read_excel(new_iri_file)
-                    required = {"Section ID", "IRI (m/km)"}
-                    if not required.issubset(set(new_iri_df.columns)):
-                        st.error(f"File must contain columns: {', '.join(required)}")
-                    else:
-                        if st.button("Replace IRI data with uploaded file", key="confirm_iri_replace"):
-                            st.session_state.iri_input = new_iri_df
-                            st.success(f"Loaded {len(new_iri_df)} IRI records.")
-                            st.rerun()
-                except Exception as e:
-                    st.error(f"Could not read file: {e}")
-
-        st.caption(
-            "Or upload a single Excel file with both `PCI_Input` and `IRI_Input` sheets "
-            "using the **Data Source** option in the sidebar instead."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Compute results (used by Results + Dashboard tabs)
-# ---------------------------------------------------------------------------
-pci_summary = compute_pci(
-    st.session_state.pci_input,
-    defect_weights=st.session_state.defect_weights,
-    severity_factors=st.session_state.severity_factors,
-    pci_bands=st.session_state.pci_bands,
-)
-iri_summary = compute_iri(st.session_state.iri_input, iri_bands=st.session_state.iri_bands)
-hybrid_summary = compute_hybrid(pci_summary, iri_summary,
-                                 pci_bands=st.session_state.pci_bands,
-                                 iri_bands=st.session_state.iri_bands)
-
-# ---------------------------------------------------------------------------
-# TAB 2: Computation & Results
-# ---------------------------------------------------------------------------
-with tab_results:
-    st.subheader(f"Results — {mode} Mode")
-
-    if mode == "PCI":
-        display_df = pci_summary.rename(columns={"PCI Recommendation": "Maintenance Recommendation"})
-        cond_col = ["PCI Condition"]
-        final_cond_col = "PCI Condition"
-    elif mode == "IRI":
-        display_df = iri_summary.rename(columns={"IRI Recommendation": "Maintenance Recommendation"})
-        cond_col = ["IRI Condition"]
-        final_cond_col = "IRI Condition"
-    else:
-        display_df = hybrid_summary[[
-            "Section ID", "PCI", "PCI Condition", "Avg IRI (m/km)", "IRI Condition",
-            "Hybrid Condition", "Hybrid Recommendation"
-        ]].rename(columns={"Hybrid Recommendation": "Maintenance Recommendation"})
-        cond_col = ["PCI Condition", "IRI Condition", "Hybrid Condition"]
-        final_cond_col = "Hybrid Condition"
-
-    # -----------------------------------------------------------------
-    # Filters (fully opt-in — table shows everything until user turns this on)
-    # -----------------------------------------------------------------
-    use_filters = st.toggle("🔎 Filter results", value=False,
-                             help="Turn on to narrow down the table by section, condition, or defect type.")
-
-    all_sections = sorted(display_df["Section ID"].dropna().astype(int).unique().tolist())
-    all_defects = sorted(st.session_state.pci_input["Defect Type"].dropna().unique().tolist()) if mode != "IRI" else []
-
-    if use_filters:
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            sel_sections = st.multiselect(
-                "Section ID", options=all_sections, default=[],
-                placeholder="All sections",
-                help="Leave empty to include all sections, or pick specific ones",
-            )
-        with fc2:
-            sel_conditions = st.multiselect(
-                "Condition", options=["Very Good", "Good", "Fair", "Poor"], default=[],
-                placeholder="All conditions",
-                help="Leave empty to include all conditions, or pick specific ones",
-            )
-        with fc3:
-            if mode != "IRI":
-                sel_defects = st.multiselect(
-                    "Defect Type present", options=all_defects, default=[],
-                    placeholder="All defect types",
-                    help="Leave empty to include all defect types, or pick specific ones",
-                )
-            else:
-                sel_defects = []
-                st.caption("Defect type filter is only available in PCI / Hybrid mode.")
-    else:
-        sel_sections, sel_conditions, sel_defects = [], [], []
-
-    # Apply filters — an empty selection means "no constraint" on that field
-    filtered_df = display_df.copy()
-    if sel_sections:
-        filtered_df = filtered_df[filtered_df["Section ID"].isin(sel_sections)]
-    if sel_conditions:
-        filtered_df = filtered_df[filtered_df[final_cond_col].isin(sel_conditions)]
-    if sel_defects:
-        sections_with_defect = st.session_state.pci_input[
-            st.session_state.pci_input["Defect Type"].isin(sel_defects)
-        ]["Section ID"].dropna().astype(int).unique().tolist()
-        filtered_df = filtered_df[filtered_df["Section ID"].isin(sections_with_defect)]
-
-    if use_filters and (sel_sections or sel_conditions or sel_defects):
-        st.caption(f"Showing {len(filtered_df)} of {len(display_df)} sections")
-
-    st.dataframe(
-        colored_condition_table(filtered_df, cond_col),
-        use_container_width=True,
-        height=min(45 * (len(filtered_df) + 1), 450),
-    )
-
-    # Quick stats row (reflects filtered results)
-    counts = filtered_df[final_cond_col].value_counts()
-    cols = st.columns(4)
-    for i, band in enumerate(["Very Good", "Good", "Fair", "Poor"]):
-        n = int(counts.get(band, 0))
-        cols[i].metric(band, n, help=f"{n} of {len(filtered_df)} shown sections")
-
-    csv_buf = io.StringIO()
-    filtered_df.to_csv(csv_buf, index=False)
-    st.download_button(
-        "⬇️ Download Filtered Results as CSV",
-        csv_buf.getvalue(),
-        file_name=f"pavement_results_{mode.split()[0].lower()}.csv",
-        mime="text/csv",
-    )
-
-
-# ---------------------------------------------------------------------------
-# TAB 3: Dashboard
-# ---------------------------------------------------------------------------
-with tab_dashboard:
-    st.subheader("Network Condition Dashboard")
-
-    if mode == "PCI":
-        value_col, cond_col, label = "PCI", "PCI Condition", "PCI"
-        chart_df = pci_summary
-        rec_col = "PCI Recommendation"
-    elif mode == "IRI":
-        value_col, cond_col, label = "Avg IRI (m/km)", "IRI Condition", "IRI (m/km)"
-        chart_df = iri_summary
-        rec_col = "IRI Recommendation"
-    else:
-        value_col, cond_col, label = "PCI", "Hybrid Condition", "Hybrid (worse of PCI/IRI)"
-        chart_df = hybrid_summary
-        rec_col = "Hybrid Recommendation"
-
-    # -----------------------------------------------------------------
-    # Network-level KPI summary
-    # -----------------------------------------------------------------
-    n_total = len(chart_df)
-    n_poor = int((chart_df[cond_col] == "Poor").sum())
-    n_good_or_better = int(chart_df[cond_col].isin(["Very Good", "Good"]).sum())
-    avg_value = chart_df[value_col].mean() if n_total else 0
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Sections", n_total)
-    k2.metric(f"Network Avg {label.split(' ')[0]}", f"{avg_value:.1f}")
-    k3.metric("Sections in Good+ Condition", f"{n_good_or_better}/{n_total}",
-              help="Very Good or Good condition")
-    k4.metric("Sections Needing Major Action", n_poor,
-              delta=None if n_poor == 0 else f"{n_poor} Poor", delta_color="inverse")
-
-    st.divider()
-
-    c1, c2 = st.columns([3, 2])
-
-    with c1:
-        bar = px.bar(
-            chart_df, x="Section ID", y=value_col, color=cond_col,
-            color_discrete_map=CONDITION_COLORS,
-            title=f"{label} by Section",
-            text=value_col,
-        )
-        bar.update_traces(texttemplate="%{text:.1f}", textposition="outside")
-        bar.update_layout(xaxis=dict(dtick=1), showlegend=True)
-        st.plotly_chart(bar, use_container_width=True)
-
-    with c2:
-        pie_counts = chart_df[cond_col].value_counts().reset_index()
-        pie_counts.columns = ["Condition", "Count"]
-        pie = px.pie(
-            pie_counts, names="Condition", values="Count",
-            color="Condition", color_discrete_map=CONDITION_COLORS,
-            title="Condition Distribution", hole=0.45,
-        )
-        st.plotly_chart(pie, use_container_width=True)
-
-    if mode.startswith("Hybrid"):
-        st.markdown("**PCI vs IRI Comparison per Section**")
-        comp = go.Figure()
-        comp.add_trace(go.Scatter(
-            x=hybrid_summary["Section ID"], y=hybrid_summary["PCI"],
-            mode="lines+markers", name="PCI (0-100 scale)"
-        ))
-        comp.add_trace(go.Scatter(
-            x=hybrid_summary["Section ID"], y=hybrid_summary["Avg IRI (m/km)"] * 20,
-            mode="lines+markers", name="IRI x20 (scaled for comparison)"
-        ))
-        comp.update_layout(xaxis_title="Section ID", yaxis_title="Score (scaled)",
-                            title="Do PCI and IRI agree on condition across sections?")
-        st.plotly_chart(comp, use_container_width=True)
-        st.caption(
-            "When PCI and IRI disagree on a section's condition, the Hybrid Index takes "
-            "the more conservative (worse) classification — prioritizing road user safety."
-        )
-
-    st.divider()
-
-    # -----------------------------------------------------------------
-    # Defect frequency across the network (PCI / Hybrid only)
-    # -----------------------------------------------------------------
-    if mode != "IRI":
-        d1, d2 = st.columns(2)
-        with d1:
-            st.markdown("**Most Common Defect Types Across the Network**")
-            defect_counts = st.session_state.pci_input["Defect Type"].value_counts().reset_index()
-            defect_counts.columns = ["Defect Type", "Occurrences"]
-            freq_chart = px.bar(
-                defect_counts.sort_values("Occurrences"), x="Occurrences", y="Defect Type",
-                orientation="h", title="Defect Frequency (all sections)",
-                color="Occurrences", color_continuous_scale="OrRd",
-            )
-            freq_chart.update_layout(showlegend=False, coloraxis_showscale=False)
-            st.plotly_chart(freq_chart, use_container_width=True)
-
-        with d2:
-            st.markdown("**Severity Breakdown of Recorded Defects**")
-            sev_counts = st.session_state.pci_input["Severity"].value_counts().reindex(
-                ["Low", "Medium", "High"]
-            ).fillna(0).reset_index()
-            sev_counts.columns = ["Severity", "Count"]
-            sev_colors = {"Low": "#9E9D24", "Medium": "#F57C00", "High": "#C62828"}
-            sev_chart = px.bar(
-                sev_counts, x="Severity", y="Count", color="Severity",
-                color_discrete_map=sev_colors, title="Defect Severity Distribution",
-            )
-            sev_chart.update_layout(showlegend=False)
-            st.plotly_chart(sev_chart, use_container_width=True)
-
-        st.divider()
-
-    # -----------------------------------------------------------------
-    # Maintenance action plan summary
-    # -----------------------------------------------------------------
-    st.markdown("**Maintenance Action Plan — Sections per Recommended Action**")
-    action_counts = chart_df[rec_col].value_counts().reset_index()
-    action_counts.columns = ["Recommended Action", "Number of Sections"]
-    action_chart = px.bar(
-        action_counts, x="Number of Sections", y="Recommended Action",
-        orientation="h", title="Sections by Maintenance Action Needed",
-        text="Number of Sections",
-    )
-    action_chart.update_layout(showlegend=False, yaxis=dict(automargin=True))
-    st.plotly_chart(action_chart, use_container_width=True)
-    st.caption(
-        "Use this to estimate workload and prioritize budget allocation across "
-        "maintenance categories for the upcoming cycle."
-    )
-
-    st.divider()
-
-    # -----------------------------------------------------------------
-    # Priority leaderboard — ranked worst sections
-    # -----------------------------------------------------------------
-    st.markdown("**🚧 Priority Leaderboard — Sections Ranked by Urgency**")
-    leaderboard = chart_df.copy()
-    cond_rank = {"Poor": 0, "Fair": 1, "Good": 2, "Very Good": 3}
-    leaderboard["_rank"] = leaderboard[cond_col].map(cond_rank)
-    leaderboard = leaderboard.sort_values(["_rank", value_col]).drop(columns="_rank")
-
-    if (leaderboard[cond_col] == "Poor").any() or (leaderboard[cond_col] == "Fair").any():
-        top_n = min(5, len(leaderboard))
-        st.dataframe(
-            colored_condition_table(leaderboard.head(top_n), [cond_col]),
-            use_container_width=True,
-            height=45 * (top_n + 1),
-        )
-        st.caption(f"Top {top_n} sections most in need of intervention, worst first.")
-    else:
-        st.success("No sections currently in Fair or Poor condition — network is in good shape overall.")
-
-
-# ---------------------------------------------------------------------------
-# TAB 4: Methodology / About
-# ---------------------------------------------------------------------------
-with tab_about:
-    st.subheader("Methodology")
-
-    st.markdown("""
-**Pavement Condition Index (PCI)**
-
-For each defect observed in a section:
-
-```
-Deduct Value = Weighting Factor × Severity Factor × Area Affected (%)
-```
-
-All deduct values in a section are summed, then:
-
-```
-PCI = 100 − (Sum of Deduct Values), floored at 0
-```
-
-This is a linear simplification of ASTM D6433's curve-based deduct value
-method, adapted for course use. The full standard uses non-linear deduct
-curves per defect type and a Corrected Deduct Value (CDV) process to avoid
-double-penalizing sections with many simultaneous defects.
-
-**International Roughness Index (IRI)**
-
-```
-Section IRI = Average of segment-level IRI readings (m/km)
-```
-
-**Hybrid Index**
-
-Combines PCI and IRI by selecting the more conservative (worse) of the two
-classifications for each section — reflecting the engineering judgment that
-either indicator showing poor condition is sufficient grounds for concern.
-    """)
-
-    st.markdown("**Condition Bands**")
-    bc1, bc2 = st.columns(2)
-    with bc1:
-        st.markdown("*PCI Bands*")
-        st.table(bands_to_dataframe(st.session_state.pci_bands, "PCI"))
-    with bc2:
-        st.markdown("*IRI Bands*")
-        st.table(bands_to_dataframe(st.session_state.iri_bands, "IRI"))
-
-    st.markdown("**Defect Weighting Factors**")
-    st.table(pd.DataFrame(
-        list(st.session_state.defect_weights.items()),
-        columns=["Defect Type", "Weighting Factor"]
-    ))
-
-    st.caption(
-        "References: ASTM D6433 (PCI Survey Standard); JKR Pavement Maintenance Manual; "
-        "JKR IRI Classification Guidance."
-    )
