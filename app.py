@@ -842,18 +842,37 @@ with tab_planning:
 
             result = simulate_maintenance(current_pci, current_iri, sim_action)
 
+            def metric_with_condition_badge(label, value, condition):
+                color = CONDITION_COLORS.get(condition, "#888")
+                st.markdown(
+                    f"""
+                    <div style='margin-bottom:8px;'>
+                        <span style='font-size:0.85rem; color:#aaa;'>{label}</span><br>
+                        <span style='font-size:1.6rem; font-weight:600;'>{value}</span><br>
+                        <span style='display:inline-block; margin-top:2px; padding:2px 10px;
+                                      border-radius:10px; font-size:0.8rem; font-weight:600;
+                                      background-color:{color}22; color:{color};'>{condition}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
             st.markdown(f"##### Projected Impact on Section {sim_section}")
             r1, r2 = st.columns(2)
             with r1:
                 st.markdown("**PCI**")
                 bc1, bc2 = st.columns(2)
-                bc1.metric("Before", f"{result['before_pci']:.1f}", result['before_pci_class'])
-                bc2.metric("After", f"{result['after_pci']:.1f}", result['after_pci_class'])
+                with bc1:
+                    metric_with_condition_badge("Before", f"{result['before_pci']:.1f}", result['before_pci_class'])
+                with bc2:
+                    metric_with_condition_badge("After", f"{result['after_pci']:.1f}", result['after_pci_class'])
             with r2:
                 st.markdown("**IRI (m/km)**")
                 ic1, ic2 = st.columns(2)
-                ic1.metric("Before", f"{result['before_iri']:.2f}", result['before_iri_class'])
-                ic2.metric("After", f"{result['after_iri']:.2f}", result['after_iri_class'])
+                with ic1:
+                    metric_with_condition_badge("Before", f"{result['before_iri']:.2f}", result['before_iri_class'])
+                with ic2:
+                    metric_with_condition_badge("After", f"{result['after_iri']:.2f}", result['after_iri_class'])
 
             sim_chart = go.Figure()
             sim_chart.add_trace(go.Bar(
