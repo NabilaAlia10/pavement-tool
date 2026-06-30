@@ -158,6 +158,25 @@ if data_source == "Upload my own file" and uploaded_file is not None:
         st.session_state.pci_input = pci_input_raw.copy()
         st.session_state.iri_input = iri_input_raw.copy()
 
+st.sidebar.subheader("Data Management")
+dm1, dm2 = st.sidebar.columns(2)
+with dm1:
+    if st.button("🗑️ Clear All Data", use_container_width=True,
+                  help="Empty the input tables — useful for demoing data entry from scratch."):
+        st.session_state.pci_input = pd.DataFrame(
+            columns=["Section ID", "Defect Type", "Severity", "Area Affected (%)", "Notes", "Photo"]
+        )
+        st.session_state.iri_input = pd.DataFrame(
+            columns=["Section ID", "Segment ID", "Start Chainage (m)", "End Chainage (m)", "IRI (m/km)", "Notes"]
+        )
+        st.rerun()
+with dm2:
+    if st.button("↩️ Restore Sample Data", use_container_width=True,
+                  help="Bring back the original 10-section dataset."):
+        st.session_state.pci_input = pci_input_raw.copy()
+        st.session_state.iri_input = iri_input_raw.copy()
+        st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # Lookup table state
