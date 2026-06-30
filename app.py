@@ -6,6 +6,7 @@ Run with:  streamlit run app.py
 """
 
 import io
+import base64
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -142,6 +143,14 @@ if "pci_input" not in st.session_state:
 if "iri_input" not in st.session_state:
     st.session_state.iri_input = iri_input_raw.copy()
 
+# Ensure Notes/Photo columns always exist (old datasets may only have "Notes / Photo Ref")
+if "Notes / Photo Ref" in st.session_state.pci_input.columns and "Notes" not in st.session_state.pci_input.columns:
+    st.session_state.pci_input = st.session_state.pci_input.rename(columns={"Notes / Photo Ref": "Notes"})
+if "Notes" not in st.session_state.pci_input.columns:
+    st.session_state.pci_input["Notes"] = ""
+if "Photo" not in st.session_state.pci_input.columns:
+    st.session_state.pci_input["Photo"] = ""
+
 # Reset session data if a new file is uploaded
 if data_source == "Upload my own file" and uploaded_file is not None:
     if st.sidebar.button("Reload uploaded data"):
@@ -227,17 +236,26 @@ with tab_input:
             with c2:
                 f_severity = st.selectbox("Severity", list(st.session_state.severity_factors.keys()), index=1)
                 f_area = st.number_input("Area Affected (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
-            f_notes = st.text_input("Notes / Photo Ref (optional)", "")
+            f_notes = st.text_input("Notes (optional)", "")
+            f_photo = st.file_uploader(
+                "📷 Attach a photo (optional)", type=["png", "jpg", "jpeg"], key="pci_photo_upload"
+            )
             submitted_pci = st.form_submit_button("➕ Add PCI Entry", use_container_width=True, type="primary")
             if submitted_pci:
+                photo_data_uri = ""
+                if f_photo is not None:
+                    img_bytes = f_photo.getvalue()
+                    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                    mime = "image/png" if f_photo.type == "image/png" else "image/jpeg"
+                    photo_data_uri = f"data:{mime};base64,{img_b64}"
                 new_row = pd.DataFrame([{
                     "Section ID": f_section, "Defect Type": f_defect, "Severity": f_severity,
-                    "Area Affected (%)": f_area, "Notes / Photo Ref": f_notes,
+                    "Area Affected (%)": f_area, "Notes": f_notes, "Photo": photo_data_uri,
                 }])
                 st.session_state.pci_input = pd.concat(
                     [st.session_state.pci_input, new_row], ignore_index=True
                 )
-                st.success(f"Added: Section {f_section} — {f_defect} ({f_severity}, {f_area}%)")
+                st.success(f"Added: Section {f_section} — {f_defect} ({f_severity}, {f_area}%)" + (" 📷" if photo_data_uri else ""))
 
     else:
         with st.form("add_iri_form", clear_on_submit=True):
@@ -298,6 +316,7 @@ with tab_input:
                     options=list(st.session_state.severity_factors.keys())
                 ),
                 "Area Affected (%)": st.column_config.NumberColumn(min_value=0, max_value=100, step=0.1),
+                "Photo": st.column_config.ImageColumn("Photo", help="Defect photo, if attached"),
             },
             key="pci_editor",
         )
@@ -330,7 +349,7 @@ with tab_input:
                 "Defect Type": ["Potholes", "Longitudinal Crack"],
                 "Severity": ["Medium", "Low"],
                 "Area Affected (%)": [5.0, 3.0],
-                "Notes / Photo Ref": ["", ""],
+                "Notes": ["", ""],
             })
             tmpl_buf = io.StringIO()
             pci_template.to_csv(tmpl_buf, index=False)
@@ -351,6 +370,10 @@ with tab_input:
                     if not required.issubset(set(new_pci_df.columns)):
                         st.error(f"File must contain columns: {', '.join(required)}")
                     else:
+                        if "Notes" not in new_pci_df.columns:
+                            new_pci_df["Notes"] = ""
+                        if "Photo" not in new_pci_df.columns:
+                            new_pci_df["Photo"] = ""
                         if st.button("Replace PCI data with uploaded file", key="confirm_pci_replace"):
                             st.session_state.pci_input = new_pci_df
                             st.success(f"Loaded {len(new_pci_df)} PCI records.")
@@ -423,34 +446,80 @@ with tab_results:
     if mode == "PCI":
         display_df = pci_summary.rename(columns={"PCI Recommendation": "Maintenance Recommendation"})
         cond_col = ["PCI Condition"]
+        final_cond_col = "PCI Condition"
     elif mode == "IRI":
         display_df = iri_summary.rename(columns={"IRI Recommendation": "Maintenance Recommendation"})
         cond_col = ["IRI Condition"]
+        final_cond_col = "IRI Condition"
     else:
         display_df = hybrid_summary[[
             "Section ID", "PCI", "PCI Condition", "Avg IRI (m/km)", "IRI Condition",
             "Hybrid Condition", "Hybrid Recommendation"
         ]].rename(columns={"Hybrid Recommendation": "Maintenance Recommendation"})
         cond_col = ["PCI Condition", "IRI Condition", "Hybrid Condition"]
+        final_cond_col = "Hybrid Condition"
+
+    # -----------------------------------------------------------------
+    # Filters
+    # -----------------------------------------------------------------
+    with st.expander("🔎 Filters", expanded=True):
+        fc1, fc2, fc3 = st.columns(3)
+
+        all_sections = sorted(display_df["Section ID"].dropna().astype(int).unique().tolist())
+        with fc1:
+            sel_sections = st.multiselect(
+                "Section ID", options=all_sections, default=all_sections,
+                help="Show only these sections",
+            )
+
+        with fc2:
+            sel_conditions = st.multiselect(
+                "Condition", options=["Very Good", "Good", "Fair", "Poor"],
+                default=["Very Good", "Good", "Fair", "Poor"],
+                help="Show only sections with this final condition",
+            )
+
+        with fc3:
+            if mode != "IRI":
+                all_defects = sorted(st.session_state.pci_input["Defect Type"].dropna().unique().tolist())
+                sel_defects = st.multiselect(
+                    "Defect Type present", options=all_defects, default=all_defects,
+                    help="Show only sections that have at least one of the selected defect types",
+                )
+            else:
+                sel_defects = None
+                st.caption("Defect type filter is only available in PCI / Hybrid mode.")
+
+    # Apply filters
+    filtered_df = display_df[
+        display_df["Section ID"].isin(sel_sections) & display_df[final_cond_col].isin(sel_conditions)
+    ].copy()
+
+    if sel_defects is not None and len(sel_defects) < len(sorted(st.session_state.pci_input["Defect Type"].dropna().unique().tolist())):
+        sections_with_defect = st.session_state.pci_input[
+            st.session_state.pci_input["Defect Type"].isin(sel_defects)
+        ]["Section ID"].dropna().astype(int).unique().tolist()
+        filtered_df = filtered_df[filtered_df["Section ID"].isin(sections_with_defect)]
+
+    st.caption(f"Showing {len(filtered_df)} of {len(display_df)} sections")
 
     st.dataframe(
-        colored_condition_table(display_df, cond_col),
+        colored_condition_table(filtered_df, cond_col),
         use_container_width=True,
-        height=min(45 * (len(display_df) + 1), 450),
+        height=min(45 * (len(filtered_df) + 1), 450),
     )
 
-    # Quick stats row
-    final_cond_col = "Hybrid Condition" if mode.startswith("Hybrid") else cond_col[0]
-    counts = display_df[final_cond_col].value_counts()
+    # Quick stats row (reflects filtered results)
+    counts = filtered_df[final_cond_col].value_counts()
     cols = st.columns(4)
     for i, band in enumerate(["Very Good", "Good", "Fair", "Poor"]):
         n = int(counts.get(band, 0))
-        cols[i].metric(band, n, help=f"{n} of {len(display_df)} sections")
+        cols[i].metric(band, n, help=f"{n} of {len(filtered_df)} shown sections")
 
     csv_buf = io.StringIO()
-    display_df.to_csv(csv_buf, index=False)
+    filtered_df.to_csv(csv_buf, index=False)
     st.download_button(
-        "⬇️ Download Results as CSV",
+        "⬇️ Download Filtered Results as CSV",
         csv_buf.getvalue(),
         file_name=f"pavement_results_{mode.split()[0].lower()}.csv",
         mime="text/csv",
@@ -466,12 +535,33 @@ with tab_dashboard:
     if mode == "PCI":
         value_col, cond_col, label = "PCI", "PCI Condition", "PCI"
         chart_df = pci_summary
+        rec_col = "PCI Recommendation"
     elif mode == "IRI":
         value_col, cond_col, label = "Avg IRI (m/km)", "IRI Condition", "IRI (m/km)"
         chart_df = iri_summary
+        rec_col = "IRI Recommendation"
     else:
         value_col, cond_col, label = "PCI", "Hybrid Condition", "Hybrid (worse of PCI/IRI)"
         chart_df = hybrid_summary
+        rec_col = "Hybrid Recommendation"
+
+    # -----------------------------------------------------------------
+    # Network-level KPI summary
+    # -----------------------------------------------------------------
+    n_total = len(chart_df)
+    n_poor = int((chart_df[cond_col] == "Poor").sum())
+    n_good_or_better = int(chart_df[cond_col].isin(["Very Good", "Good"]).sum())
+    avg_value = chart_df[value_col].mean() if n_total else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Sections", n_total)
+    k2.metric(f"Network Avg {label.split(' ')[0]}", f"{avg_value:.1f}")
+    k3.metric("Sections in Good+ Condition", f"{n_good_or_better}/{n_total}",
+              help="Very Good or Good condition")
+    k4.metric("Sections Needing Major Action", n_poor,
+              delta=None if n_poor == 0 else f"{n_poor} Poor", delta_color="inverse")
+
+    st.divider()
 
     c1, c2 = st.columns([3, 2])
 
@@ -515,13 +605,80 @@ with tab_dashboard:
             "the more conservative (worse) classification — prioritizing road user safety."
         )
 
-    st.markdown("**Sections Needing Priority Attention**")
-    priority = chart_df[chart_df[cond_col].isin(["Poor"])]
-    if priority.empty:
-        st.success("No sections currently classified as Poor.")
+    st.divider()
+
+    # -----------------------------------------------------------------
+    # Defect frequency across the network (PCI / Hybrid only)
+    # -----------------------------------------------------------------
+    if mode != "IRI":
+        d1, d2 = st.columns(2)
+        with d1:
+            st.markdown("**Most Common Defect Types Across the Network**")
+            defect_counts = st.session_state.pci_input["Defect Type"].value_counts().reset_index()
+            defect_counts.columns = ["Defect Type", "Occurrences"]
+            freq_chart = px.bar(
+                defect_counts.sort_values("Occurrences"), x="Occurrences", y="Defect Type",
+                orientation="h", title="Defect Frequency (all sections)",
+                color="Occurrences", color_continuous_scale="OrRd",
+            )
+            freq_chart.update_layout(showlegend=False, coloraxis_showscale=False)
+            st.plotly_chart(freq_chart, use_container_width=True)
+
+        with d2:
+            st.markdown("**Severity Breakdown of Recorded Defects**")
+            sev_counts = st.session_state.pci_input["Severity"].value_counts().reindex(
+                ["Low", "Medium", "High"]
+            ).fillna(0).reset_index()
+            sev_counts.columns = ["Severity", "Count"]
+            sev_colors = {"Low": "#9E9D24", "Medium": "#F57C00", "High": "#C62828"}
+            sev_chart = px.bar(
+                sev_counts, x="Severity", y="Count", color="Severity",
+                color_discrete_map=sev_colors, title="Defect Severity Distribution",
+            )
+            sev_chart.update_layout(showlegend=False)
+            st.plotly_chart(sev_chart, use_container_width=True)
+
+        st.divider()
+
+    # -----------------------------------------------------------------
+    # Maintenance action plan summary
+    # -----------------------------------------------------------------
+    st.markdown("**Maintenance Action Plan — Sections per Recommended Action**")
+    action_counts = chart_df[rec_col].value_counts().reset_index()
+    action_counts.columns = ["Recommended Action", "Number of Sections"]
+    action_chart = px.bar(
+        action_counts, x="Number of Sections", y="Recommended Action",
+        orientation="h", title="Sections by Maintenance Action Needed",
+        text="Number of Sections",
+    )
+    action_chart.update_layout(showlegend=False, yaxis=dict(automargin=True))
+    st.plotly_chart(action_chart, use_container_width=True)
+    st.caption(
+        "Use this to estimate workload and prioritize budget allocation across "
+        "maintenance categories for the upcoming cycle."
+    )
+
+    st.divider()
+
+    # -----------------------------------------------------------------
+    # Priority leaderboard — ranked worst sections
+    # -----------------------------------------------------------------
+    st.markdown("**🚧 Priority Leaderboard — Sections Ranked by Urgency**")
+    leaderboard = chart_df.copy()
+    cond_rank = {"Poor": 0, "Fair": 1, "Good": 2, "Very Good": 3}
+    leaderboard["_rank"] = leaderboard[cond_col].map(cond_rank)
+    leaderboard = leaderboard.sort_values(["_rank", value_col]).drop(columns="_rank")
+
+    if (leaderboard[cond_col] == "Poor").any() or (leaderboard[cond_col] == "Fair").any():
+        top_n = min(5, len(leaderboard))
+        st.dataframe(
+            colored_condition_table(leaderboard.head(top_n), [cond_col]),
+            use_container_width=True,
+            height=45 * (top_n + 1),
+        )
+        st.caption(f"Top {top_n} sections most in need of intervention, worst first.")
     else:
-        st.warning(f"{len(priority)} section(s) classified as Poor — recommend prioritizing in next maintenance cycle.")
-        st.dataframe(priority, use_container_width=True)
+        st.success("No sections currently in Fair or Poor condition — network is in good shape overall.")
 
 
 # ---------------------------------------------------------------------------
