@@ -123,9 +123,11 @@ def load_uploaded_data(file):
         iri_header = _find_header_row(xls, "IRI_Input")
         pci = pd.read_excel(xls, sheet_name="PCI_Input", header=pci_header)
         iri = pd.read_excel(xls, sheet_name="IRI_Input", header=iri_header)
-        # Drop any stray fully-blank rows and ensure Section ID is numeric
-        pci = pci[pd.to_numeric(pci["Section ID"], errors="coerce").notna()]
-        iri = iri[pd.to_numeric(iri["Section ID"], errors="coerce").notna()]
+        # Drop fully-blank rows; keep Section ID as string
+        pci = pci[pci["Section ID"].notna()]
+        iri = iri[iri["Section ID"].notna()]
+        pci["Section ID"] = pci["Section ID"].astype(str)
+        iri["Section ID"] = iri["Section ID"].astype(str)
         return pci, iri
     else:
         st.sidebar.warning("CSV upload: please upload PCI_Input first, then IRI_Input separately below.")
@@ -167,7 +169,7 @@ with dm1:
             columns=["Section ID", "Defect Type", "Severity", "Area Affected (%)", "Notes", "Photo"]
         )
         st.session_state.iri_input = pd.DataFrame(
-            columns=["Section ID", "Segment ID", "Start Chainage (m)", "End Chainage (m)", "IRI (m/km)", "Notes"]
+            columns=["Section ID", "IRI (m/km)", "Notes"]
         )
         st.rerun()
 with dm2:
@@ -221,139 +223,175 @@ tab_input, tab_results, tab_dashboard, tab_planning, tab_about = st.tabs(
 # ---------------------------------------------------------------------------
 with tab_input:
     st.subheader("Pavement Condition Input Data")
-    st.caption("Add a defect or roughness reading below. Results update automatically.")
-
-    # =======================================================================
-    # SECTION A: Add a record (form-based entry) — PRIMARY WORKFLOW
-    # =======================================================================
-    entry_type = st.radio(
-        "What would you like to add?",
-        ["PCI defect observation", "IRI roughness reading"],
-        horizontal=True,
-        key="entry_type_choice",
+    st.caption(
+        "Each entry submits **both** a PCI defect observation and an IRI roughness reading "
+        "for the same section together. Add multiple defects or IRI readings per section by submitting again."
     )
 
-    if entry_type == "PCI defect observation":
-        with st.form("add_pci_form", clear_on_submit=True):
-            existing_sections = sorted(set(
-                pd.to_numeric(st.session_state.pci_input["Section ID"], errors="coerce").dropna().astype(int).tolist()
-            ))
-            section_choices = [str(s) for s in existing_sections] + ["+ New Section"]
-            c1, c2 = st.columns(2)
-            with c1:
-                f_section_choice = st.selectbox(
-                    "Section ID", section_choices,
-                    index=len(section_choices) - 2 if existing_sections else 0,
-                )
-                if f_section_choice == "+ New Section":
-                    f_section = st.number_input(
-                        "New Section ID", min_value=1, max_value=999,
-                        value=(max(existing_sections) + 1) if existing_sections else 1, step=1,
-                    )
-                else:
-                    f_section = int(f_section_choice)
-                f_defect = st.selectbox("Defect Type", list(st.session_state.defect_weights.keys()))
-            with c2:
-                f_severity = st.selectbox("Severity", list(st.session_state.severity_factors.keys()), index=1)
-                f_area = st.number_input("Area Affected (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
-            f_notes = st.text_input("Notes (optional)", "")
-            f_photo = st.file_uploader(
-                "📷 Attach a photo (optional)", type=["png", "jpg", "jpeg"], key="pci_photo_upload"
+    # =======================================================================
+    # SECTION A: Combined PCI + IRI form — PRIMARY WORKFLOW
+    # =======================================================================
+    st.markdown("### ➕ Add a Section Entry")
+
+    # Collect all existing section IDs (as strings)
+    existing_pci_sections = sorted(set(
+        st.session_state.pci_input["Section ID"].dropna().astype(str).tolist()
+    ))
+    existing_iri_sections = sorted(set(
+        st.session_state.iri_input["Section ID"].dropna().astype(str).tolist()
+    ))
+    all_existing_sections = sorted(set(existing_pci_sections + existing_iri_sections))
+
+    with st.form("combined_entry_form", clear_on_submit=True):
+        st.markdown("#### 📍 Section Identification")
+        sec_col1, sec_col2 = st.columns(2)
+        with sec_col1:
+            section_mode = st.radio(
+                "Section", ["Existing section", "New section"],
+                horizontal=True, key="section_mode_radio"
             )
-            submitted_pci = st.form_submit_button("➕ Add PCI Entry", use_container_width=True, type="primary")
-            if submitted_pci:
+        with sec_col2:
+            if section_mode == "Existing section" and all_existing_sections:
+                f_section = st.selectbox(
+                    "Select Section", all_existing_sections,
+                    help="Add more defect records or IRI readings to an existing section"
+                )
+            else:
+                f_section = st.text_input(
+                    "Section Name / ID",
+                    placeholder="e.g. Jalan Bako KM3, Section A, S01",
+                    help="Type any name or code — road name, chainage, or a simple number"
+                )
+
+        st.markdown("---")
+        st.markdown("#### 🔍 PCI — Defect Observation")
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            f_defect = st.selectbox("Defect Type", list(st.session_state.defect_weights.keys()))
+        with p2:
+            f_severity = st.selectbox(
+                "Severity", list(st.session_state.severity_factors.keys()), index=1
+            )
+        with p3:
+            f_area = st.number_input(
+                "Area Affected (%)",
+                min_value=0.0, max_value=100.0, value=5.0, step=0.5,
+                help="Click the field and type directly, or use + / − to adjust"
+            )
+        f_notes = st.text_input("PCI Notes (optional)", "")
+        f_photo = st.file_uploader(
+            "📷 Attach a defect photo (optional)", type=["png", "jpg", "jpeg"],
+            key="pci_photo_upload"
+        )
+
+        st.markdown("---")
+        st.markdown("#### 📏 IRI — Roughness Reading")
+        st.caption(
+            "Enter one IRI reading per submission. Submit again with the same section to add more — "
+            "the app will average all readings for that section automatically."
+        )
+        i1, i2 = st.columns(2)
+        with i1:
+            g_iri = st.number_input(
+                "IRI (m/km)",
+                min_value=0.0, max_value=20.0, value=2.0, step=0.1,
+                help="Click the field and type directly, or use + / −. Typical range: 1–6 m/km"
+            )
+        with i2:
+            g_iri_notes = st.text_input("IRI Notes (optional)", "", key="iri_notes_field")
+
+        submitted = st.form_submit_button(
+            "✅ Submit Entry", use_container_width=True, type="primary"
+        )
+
+        if submitted:
+            section_val = f_section.strip() if isinstance(f_section, str) else str(f_section)
+            if not section_val or section_val in ("", "None"):
+                st.error("Please enter a Section Name / ID before submitting.")
+            else:
+                # Add PCI record
                 photo_data_uri = ""
                 if f_photo is not None:
                     img_bytes = f_photo.getvalue()
                     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
                     mime = "image/png" if f_photo.type == "image/png" else "image/jpeg"
                     photo_data_uri = f"data:{mime};base64,{img_b64}"
-                new_row = pd.DataFrame([{
-                    "Section ID": f_section, "Defect Type": f_defect, "Severity": f_severity,
-                    "Area Affected (%)": f_area, "Notes": f_notes, "Photo": photo_data_uri,
+                pci_row = pd.DataFrame([{
+                    "Section ID": section_val,
+                    "Defect Type": f_defect,
+                    "Severity": f_severity,
+                    "Area Affected (%)": f_area,
+                    "Notes": f_notes,
+                    "Photo": photo_data_uri,
                 }])
                 st.session_state.pci_input = pd.concat(
-                    [st.session_state.pci_input, new_row], ignore_index=True
+                    [st.session_state.pci_input, pci_row], ignore_index=True
                 )
-                st.success(f"Added: Section {f_section} — {f_defect} ({f_severity}, {f_area}%)" + (" 📷" if photo_data_uri else ""))
-
-    else:
-        with st.form("add_iri_form", clear_on_submit=True):
-            existing_iri_sections = sorted(set(
-                pd.to_numeric(st.session_state.iri_input["Section ID"], errors="coerce").dropna().astype(int).tolist()
-            ))
-            iri_section_choices = [str(s) for s in existing_iri_sections] + ["+ New Section"]
-            c1, c2 = st.columns(2)
-            with c1:
-                g_section_choice = st.selectbox(
-                    "Section ID", iri_section_choices,
-                    index=len(iri_section_choices) - 2 if existing_iri_sections else 0,
-                    key="iri_form_section_choice",
-                )
-                if g_section_choice == "+ New Section":
-                    g_section = st.number_input(
-                        "New Section ID", min_value=1, max_value=999,
-                        value=(max(existing_iri_sections) + 1) if existing_iri_sections else 1, step=1,
-                        key="iri_form_new_section",
-                    )
-                else:
-                    g_section = int(g_section_choice)
-                g_segment = st.number_input("Segment ID", min_value=1, max_value=50, value=1, step=1)
-            with c2:
-                g_start = st.number_input("Start Chainage (m)", min_value=0, value=0, step=10)
-                g_end = st.number_input("End Chainage (m)", min_value=0, value=20, step=10)
-            g_iri = st.number_input("IRI (m/km)", min_value=0.0, max_value=10.0, value=2.0, step=0.05)
-            g_notes = st.text_input("Notes (optional)", "", key="iri_form_notes")
-            submitted_iri = st.form_submit_button("➕ Add IRI Reading", use_container_width=True, type="primary")
-            if submitted_iri:
-                new_row = pd.DataFrame([{
-                    "Section ID": g_section, "Segment ID": g_segment,
-                    "Start Chainage (m)": g_start, "End Chainage (m)": g_end,
-                    "IRI (m/km)": g_iri, "Notes": g_notes,
+                # Add IRI record
+                iri_row = pd.DataFrame([{
+                    "Section ID": section_val,
+                    "IRI (m/km)": g_iri,
+                    "Notes": g_iri_notes,
                 }])
                 st.session_state.iri_input = pd.concat(
-                    [st.session_state.iri_input, new_row], ignore_index=True
+                    [st.session_state.iri_input, iri_row], ignore_index=True
                 )
-                st.success(f"Added: Section {g_section}, Segment {g_segment} — IRI {g_iri} m/km")
+                st.success(
+                    f"✅ Added to **{section_val}**: "
+                    f"{f_defect} ({f_severity}, {f_area}%) + IRI {g_iri} m/km"
+                    + (" 📷" if photo_data_uri else "")
+                )
 
     st.divider()
 
     # =======================================================================
-    # SECTION B: Review & edit everything (table view)
+    # SECTION B: Review & edit (table view)
     # =======================================================================
     st.markdown("##### 📋 Current Data")
     rtab1, rtab2 = st.tabs(["PCI Records", "IRI Readings"])
     with rtab1:
-        st.session_state.pci_input = st.data_editor(
-            st.session_state.pci_input,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Defect Type": st.column_config.SelectboxColumn(
-                    options=list(st.session_state.defect_weights.keys())
-                ),
-                "Severity": st.column_config.SelectboxColumn(
-                    options=list(st.session_state.severity_factors.keys())
-                ),
-                "Area Affected (%)": st.column_config.NumberColumn(min_value=0, max_value=100, step=0.1),
-                "Photo": st.column_config.ImageColumn("Photo", help="Defect photo, if attached"),
-            },
-            key="pci_editor",
-        )
+        if st.session_state.pci_input.empty:
+            st.info("No PCI records yet. Add your first entry using the form above.")
+        else:
+            st.session_state.pci_input = st.data_editor(
+                st.session_state.pci_input,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "Defect Type": st.column_config.SelectboxColumn(
+                        options=list(st.session_state.defect_weights.keys())
+                    ),
+                    "Severity": st.column_config.SelectboxColumn(
+                        options=list(st.session_state.severity_factors.keys())
+                    ),
+                    "Area Affected (%)": st.column_config.NumberColumn(
+                        min_value=0, max_value=100, step=0.1,
+                        help="Click to select, then type directly"
+                    ),
+                    "Photo": st.column_config.ImageColumn("Photo", help="Defect photo, if attached"),
+                },
+                key="pci_editor",
+            )
     with rtab2:
-        st.session_state.iri_input = st.data_editor(
-            st.session_state.iri_input,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "IRI (m/km)": st.column_config.NumberColumn(min_value=0, max_value=20, step=0.01),
-            },
-            key="iri_editor",
-        )
-    st.caption("You can edit values or delete rows directly in the tables above.")
+        if st.session_state.iri_input.empty:
+            st.info("No IRI readings yet. Add your first entry using the form above.")
+        else:
+            st.session_state.iri_input = st.data_editor(
+                st.session_state.iri_input,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "IRI (m/km)": st.column_config.NumberColumn(
+                        min_value=0, max_value=20, step=0.1,
+                        help="Click to select, then type directly"
+                    ),
+                },
+                key="iri_editor",
+            )
+    st.caption("Edit values or delete rows directly in the tables above.")
 
     # =======================================================================
-    # SECTION C: Upload your own data (secondary, tucked away)
+    # SECTION C: Upload data from a file (secondary)
     # =======================================================================
     with st.expander("📤 Upload data from a file instead", expanded=False):
         st.caption(
@@ -365,7 +403,7 @@ with tab_input:
         with up_col1:
             st.markdown("**PCI defect data**")
             pci_template = pd.DataFrame({
-                "Section ID": [1, 1],
+                "Section ID": ["Jalan Bako KM3", "Jalan Bako KM3"],
                 "Defect Type": ["Potholes", "Longitudinal Crack"],
                 "Severity": ["Medium", "Low"],
                 "Area Affected (%)": [5.0, 3.0],
@@ -382,10 +420,8 @@ with tab_input:
             )
             if new_pci_file is not None:
                 try:
-                    if new_pci_file.name.endswith(".csv"):
-                        new_pci_df = pd.read_csv(new_pci_file)
-                    else:
-                        new_pci_df = pd.read_excel(new_pci_file)
+                    new_pci_df = pd.read_csv(new_pci_file) if new_pci_file.name.endswith(".csv") \
+                        else pd.read_excel(new_pci_file)
                     required = {"Section ID", "Defect Type", "Severity", "Area Affected (%)"}
                     if not required.issubset(set(new_pci_df.columns)):
                         st.error(f"File must contain columns: {', '.join(required)}")
@@ -394,6 +430,7 @@ with tab_input:
                             new_pci_df["Notes"] = ""
                         if "Photo" not in new_pci_df.columns:
                             new_pci_df["Photo"] = ""
+                        new_pci_df["Section ID"] = new_pci_df["Section ID"].astype(str)
                         if st.button("Replace PCI data with uploaded file", key="confirm_pci_replace"):
                             st.session_state.pci_input = new_pci_df
                             st.success(f"Loaded {len(new_pci_df)} PCI records.")
@@ -404,10 +441,7 @@ with tab_input:
         with up_col2:
             st.markdown("**IRI roughness data**")
             iri_template = pd.DataFrame({
-                "Section ID": [1, 1],
-                "Segment ID": [1, 2],
-                "Start Chainage (m)": [0, 20],
-                "End Chainage (m)": [20, 40],
+                "Section ID": ["Jalan Bako KM3", "Jalan Bako KM3"],
                 "IRI (m/km)": [2.1, 2.3],
                 "Notes": ["", ""],
             })
@@ -422,17 +456,16 @@ with tab_input:
             )
             if new_iri_file is not None:
                 try:
-                    if new_iri_file.name.endswith(".csv"):
-                        new_iri_df = pd.read_csv(new_iri_file)
-                    else:
-                        new_iri_df = pd.read_excel(new_iri_file)
+                    new_iri_df = pd.read_csv(new_iri_file) if new_iri_file.name.endswith(".csv") \
+                        else pd.read_excel(new_iri_file)
                     required = {"Section ID", "IRI (m/km)"}
                     if not required.issubset(set(new_iri_df.columns)):
                         st.error(f"File must contain columns: {', '.join(required)}")
                     else:
+                        new_iri_df["Section ID"] = new_iri_df["Section ID"].astype(str)
                         if st.button("Replace IRI data with uploaded file", key="confirm_iri_replace"):
                             st.session_state.iri_input = new_iri_df
-                            st.success(f"Loaded {len(new_iri_df)} IRI records.")
+                            st.success(f"Loaded {len(new_iri_df)} IRI readings.")
                             st.rerun()
                 except Exception as e:
                     st.error(f"Could not read file: {e}")
@@ -441,6 +474,7 @@ with tab_input:
             "Or upload a single Excel file with both `PCI_Input` and `IRI_Input` sheets "
             "using the **Data Source** option in the sidebar instead."
         )
+
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +620,23 @@ with tab_dashboard:
         value_col, cond_col, label = "PCI", "Hybrid Condition", "Hybrid (worse of PCI/IRI)"
         chart_df = hybrid_summary
         rec_col = "Hybrid Recommendation"
+
+    # -----------------------------------------------------------------
+    # Dashboard section filter (opt-in, same pattern as Results tab)
+    # -----------------------------------------------------------------
+    all_dash_sections = sorted(chart_df["Section ID"].dropna().astype(str).unique().tolist())
+    use_dash_filter = st.toggle(
+        "🔎 Filter sections", value=False,
+        help="Focus the dashboard on specific sections only — leave off to show the full network."
+    )
+    if use_dash_filter and all_dash_sections:
+        sel_dash_sections = st.multiselect(
+            "Show sections", options=all_dash_sections, default=[],
+            placeholder="Leave empty for all, or pick specific sections"
+        )
+        if sel_dash_sections:
+            chart_df = chart_df[chart_df["Section ID"].astype(str).isin(sel_dash_sections)].copy()
+            st.caption(f"Showing {len(chart_df)} of {len(all_dash_sections)} sections")
 
     # -----------------------------------------------------------------
     # Network Health Score badge
