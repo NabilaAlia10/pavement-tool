@@ -348,47 +348,48 @@ with tab_input:
     # SECTION B: Review & edit (table view)
     # =======================================================================
     st.markdown("##### 📋 Current Data")
-    rtab1, rtab2 = st.tabs(["PCI Records", "IRI Readings"])
-    with rtab1:
-        if st.session_state.pci_input.empty:
-            st.info("No PCI records yet. Add your first entry using the form above.")
-        else:
-            st.session_state.pci_input = st.data_editor(
-                st.session_state.pci_input,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "Defect Type": st.column_config.SelectboxColumn(
-                        options=list(st.session_state.defect_weights.keys())
-                    ),
-                    "Severity": st.column_config.SelectboxColumn(
-                        options=list(st.session_state.severity_factors.keys())
-                    ),
-                    "Area Affected (%)": st.column_config.NumberColumn(
-                        min_value=0, max_value=100, step=0.1,
-                        help="Click to select, then type directly"
-                    ),
-                    "Photo": st.column_config.ImageColumn("Photo", help="Defect photo, if attached"),
-                },
-                key="pci_editor",
-            )
-    with rtab2:
-        if st.session_state.iri_input.empty:
-            st.info("No IRI readings yet. Add your first entry using the form above.")
-        else:
-            st.session_state.iri_input = st.data_editor(
-                st.session_state.iri_input,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "IRI (m/km)": st.column_config.NumberColumn(
-                        min_value=0, max_value=20, step=0.1,
-                        help="Click to select, then type directly"
-                    ),
-                },
-                key="iri_editor",
-            )
-    st.caption("Edit values or delete rows directly in the tables above.")
+    st.caption("Edit values or delete rows directly in the tables below.")
+
+    st.markdown("**PCI — Defect Records**")
+    if st.session_state.pci_input.empty:
+        st.info("No PCI records yet. Add your first entry using the form above.")
+    else:
+        st.session_state.pci_input = st.data_editor(
+            st.session_state.pci_input,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Defect Type": st.column_config.SelectboxColumn(
+                    options=list(st.session_state.defect_weights.keys())
+                ),
+                "Severity": st.column_config.SelectboxColumn(
+                    options=list(st.session_state.severity_factors.keys())
+                ),
+                "Area Affected (%)": st.column_config.NumberColumn(
+                    min_value=0, max_value=100, step=0.1,
+                    help="Click to select, then type directly"
+                ),
+                "Photo": st.column_config.ImageColumn("Photo", help="Defect photo, if attached"),
+            },
+            key="pci_editor",
+        )
+
+    st.markdown("**IRI — Roughness Readings**")
+    if st.session_state.iri_input.empty:
+        st.info("No IRI readings yet. Add your first entry using the form above.")
+    else:
+        st.session_state.iri_input = st.data_editor(
+            st.session_state.iri_input,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "IRI (m/km)": st.column_config.NumberColumn(
+                    min_value=0, max_value=20, step=0.1,
+                    help="Click to select, then type directly"
+                ),
+            },
+            key="iri_editor",
+        )
 
     # =======================================================================
     # SECTION C: Upload data from a file (secondary)
@@ -520,7 +521,7 @@ with tab_results:
     use_filters = st.toggle("🔎 Filter results", value=False,
                              help="Turn on to narrow down the table by section, condition, or defect type.")
 
-    all_sections = sorted(display_df["Section ID"].dropna().astype(int).unique().tolist())
+    all_sections = sorted(display_df["Section ID"].dropna().astype(str).unique().tolist())
     all_defects = sorted(st.session_state.pci_input["Defect Type"].dropna().unique().tolist()) if mode != "IRI" else []
 
     if use_filters:
@@ -559,7 +560,7 @@ with tab_results:
     if sel_defects:
         sections_with_defect = st.session_state.pci_input[
             st.session_state.pci_input["Defect Type"].isin(sel_defects)
-        ]["Section ID"].dropna().astype(int).unique().tolist()
+        ]["Section ID"].dropna().astype(str).unique().tolist()
         filtered_df = filtered_df[filtered_df["Section ID"].isin(sections_with_defect)]
 
     if use_filters and (sel_sections or sel_conditions or sel_defects):
@@ -890,7 +891,7 @@ with tab_planning:
         st.markdown("##### Simulate the Impact of a Maintenance Action")
         st.caption("Pick a section and a maintenance action to see the projected before/after condition.")
 
-        sim_sections = sorted(hybrid_summary["Section ID"].dropna().astype(int).unique().tolist())
+        sim_sections = sorted(hybrid_summary["Section ID"].dropna().astype(str).unique().tolist())
         if not sim_sections:
             st.warning("No section data available to simulate.")
         else:
